@@ -252,6 +252,10 @@ send_focus $$
 wait_for 'FOCUS_REPORT_REJECTED' "$WORK/seat.log"
 check_contains "rejects a sender without the active seat" 'reason=NOT_ACTIVE_SEAT_USER' "$WORK/seat.log"
 check "no priority without the active seat" "$(read_value "$FOCUS/memory.high")" "$HIGH_50"
+if [ "$(id -u)" != 0 ]; then
+    sleep 2.2
+    check "a refused owner change is logged once and tried again" "$(grep -c 'event=FOCUS_SOCKET_REPLACE_FAILED' "$WORK/seat.log")" 1
+fi
 echo "ACTIVE_UID=$(id -u)" > "$WORK/seats/seat0"
 send_focus $$
 wait_for 'event=FOCUS_CHANGED' "$WORK/seat.log"
@@ -280,6 +284,25 @@ start_enforce_daemon "$WORK/forged.log"
 stop_enforce_daemon "$WORK/forged.log"
 check "saved limits cannot name a path outside application groups" "$(read_value "$WORK/outside.scope/memory.high")" max
 
+start_enforce_daemon "$WORK/socket.log"
+python3 -I -c '
+import os, socket, sys, time
+path = sys.argv[1]
+sender = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+sender.connect(path)
+sender.send(b"1")
+os.chmod(path, 0o666)
+time.sleep(2.5)
+try:
+    sender.send(b"1")
+    print("STILL_CONNECTED")
+except OSError:
+    print("DISCONNECTED")
+' "$WORK/run/focus.sock" > "$WORK/socket.result"
+check "a changed socket mode is replaced" "$(stat -c %a "$WORK/run/focus.sock")" 600
+check "senders connected to the old socket are dropped" "$(cat "$WORK/socket.result")" DISCONNECTED
+stop_enforce_daemon "$WORK/socket.log"
+
 LINK_GROUP="$FAKE$APP_SLICE/app-link-test.scope"
 mkdir -p "$LINK_GROUP"
 make_group "$LINK_GROUP" max max max 100 "max 100000"
@@ -297,23 +320,61 @@ create_foreign_groups() { # uid
     mkdir -p "$FOREIGN"
     ( cd "$FOREIGN" && mkdir $(seq -f 'flood%g.scope' 1 600) )
 }
+# Groups already in the table must keep their original limits when a scan stops early at a limit.
+VICTIMS=""
+for VICTIM_UID in 200100 200101 200102; do
+    VICTIM="$FAKE/user.slice/user-$VICTIM_UID.slice/user@$VICTIM_UID.service/app.slice/app-victim.scope"
+    mkdir -p "$VICTIM"
+    make_group "$VICTIM" max max max 100 "max 100000"
+    VICTIMS="$VICTIMS $VICTIM"
+done
 create_foreign_groups 200000
 start_enforce_daemon "$WORK/flood.log"
-wait_for 'GROUPS=514 ' "$WORK/run/STATUS"
-check_contains "one user is limited to 512 groups" 'GROUPS=514 ' "$WORK/run/STATUS"
+wait_for 'GROUPS=517 ' "$WORK/run/STATUS"
+check_contains "one user is limited to 512 groups" 'GROUPS=517 ' "$WORK/run/STATUS"
+# Groups keep their place while they exist, so the limit must also hold across scans.
+( cd "$FAKE/user.slice/user-200000.slice/user@200000.service/app.slice" && mkdir $(seq -f 'later%g.scope' 1 100) )
+sleep 5.5
+wait_for 'GROUPS=517 ' "$WORK/run/STATUS"
+sleep 5.2
+check_contains "the limit holds when new groups appear between scans" 'GROUPS=517 ' "$WORK/run/STATUS"
+# The user at the active seat has the same limit, or that user could fill the table for the next one.
+( cd "$FAKE$APP_SLICE" && mkdir $(seq -f 'seat-first%g.scope' 1 300) )
+sleep 5.5
+( cd "$FAKE$APP_SLICE" && mkdir $(seq -f 'seat-second%g.scope' 1 300) )
+sleep 5.5
+wait_for 'GROUPS=1027 ' "$WORK/run/STATUS"
+sleep 5.2
+check_contains "the active user's limit holds across scans" 'GROUPS=1027 ' "$WORK/run/STATUS"
 stop_enforce_daemon "$WORK/flood.log"
-for FOREIGN_UID in 200001 200002 200003 200004 200005 200006 200007 200008; do create_foreign_groups "$FOREIGN_UID"; done
+rm -rf "$FAKE$APP_SLICE"/seat-first*.scope "$FAKE$APP_SLICE"/seat-second*.scope
 start_enforce_daemon "$WORK/flood.log"
-wait_for 'GROUPS=3584 ' "$WORK/run/STATUS"
-check_contains "other users stop below the total limit" 'GROUPS=3584 ' "$WORK/run/STATUS"
+for VICTIM in $VICTIMS; do check "a group enters the table before the flood" "$(read_value "$VICTIM/memory.high")" "$HIGH_50"; done
+for FOREIGN_UID in 200001 200002 200003 200004 200005 200006 200007 200008; do create_foreign_groups "$FOREIGN_UID"; done
+wait_for 'GROUPS=3586 ' "$WORK/run/STATUS"
+check_contains "other users stop below the total limit" 'GROUPS=3586 ' "$WORK/run/STATUS"
 check_contains "the limit is logged" 'event=GROUP_LIMIT_REACHED' "$WORK/flood.log"
 NEW_GROUP="$FAKE$APP_SLICE/app-after-flood.scope"
 mkdir -p "$NEW_GROUP"
 make_group "$NEW_GROUP" max max max 100 "max 100000"
 wait_for "$HIGH_50" "$NEW_GROUP/memory.high"
 check "the active user's new group is still accepted" "$(read_value "$NEW_GROUP/memory.high")" "$HIGH_50"
+# The next active user must also find room, even with the table full of other users' groups.
+SWITCHED_GROUP="$FAKE/user.slice/user-200100.slice/user@200100.service/app.slice/app-after-seat-change.scope"
+mkdir -p "$SWITCHED_GROUP"
+make_group "$SWITCHED_GROUP" max max max 100 "max 100000"
+echo "ACTIVE_UID=200100" > "$WORK/seats/seat0"
+wait_for "$HIGH_50" "$SWITCHED_GROUP/memory.high"
+check "the next active user's new group is accepted" "$(read_value "$SWITCHED_GROUP/memory.high")" "$HIGH_50"
+echo "ACTIVE_UID=$(id -u)" > "$WORK/seats/seat0"
+# Each of these is refused at the limit, which stops the scan of that user before its older group.
+for VICTIM in $VICTIMS; do mkdir "$(dirname "$VICTIM")/app-victim-new.scope"; done
+sleep 5.5
 stop_enforce_daemon "$WORK/flood.log"
-rm -rf "$NEW_GROUP" "$FAKE"/user.slice/user-20000?.slice
+for VICTIM in $VICTIMS; do
+    check "a group that existed before the flood gets its original limit back" "$(read_value "$VICTIM/memory.high")" max
+done
+rm -rf "$NEW_GROUP" "$FAKE"/user.slice/user-20000?.slice "$FAKE"/user.slice/user-20010?.slice
 
 chmod 775 "$WORK/run"
 "$BINARY" --config "$WORK/enforce.conf" --runtime-dir "$WORK/run" --cgroup-root "$FAKE" --proc-swaps "$WORK/swaps" --seat-directory "$WORK/seats" > /dev/null 2>&1
@@ -384,10 +445,14 @@ echo "== Disk guard"
 SIGNAL_FILE="$WORK/signal_seen"
 MANAGER_GROUP="$FAKE/system.slice/swapspace.service"
 mkdir -p "$MANAGER_GROUP"
-sh -c 'trap "echo seen >> \"$1\"" USR2; while :; do sleep 0.1; done' sh "$SIGNAL_FILE" &
+# A shell copied under the manager's name stands in for it. The other member has no handler for the signal.
+cp "$(command -v dash || command -v sh)" "$WORK/swapspace"
+"$WORK/swapspace" -c 'trap "echo seen >> \"$1\"" USR2; while :; do sleep 0.1; done' sh "$SIGNAL_FILE" &
 SIGNAL_TARGET=$!
+sleep 300 &
+SIGNAL_BYSTANDER=$!
 sleep 0.3
-echo "$SIGNAL_TARGET" > "$MANAGER_GROUP/cgroup.procs"
+printf '%s\n%s\n' "$SIGNAL_TARGET" "$SIGNAL_BYSTANDER" > "$MANAGER_GROUP/cgroup.procs"
 chmod 644 "$MANAGER_GROUP/cgroup.procs"
 : > "$SIGNAL_FILE"
 # A limit of 100% is always crossed. No memory rule would allow retiring anything here.
@@ -407,6 +472,7 @@ check_contains "the hold is logged" 'event=SWAP_GROWTH_HELD' "$WORK/retire.log"
 check_contains "status reports the hold" 'SWAP_GROWTH=HELD' "$WORK/run/STATUS"
 check "swapspace is told to add no file" "$([ -s "$SIGNAL_FILE" ] && echo yes)" yes
 check "the signal repeats while the limit holds" "$([ "$(wc -l < "$SIGNAL_FILE")" -ge 2 ] && echo yes)" yes
+check "another process in the group gets no signal" "$(kill -0 "$SIGNAL_BYSTANDER" 2>/dev/null && echo alive)" alive
 run_retire "$MEMORY_KIB" $(( MEMORY_KIB / 200 ))
 check "a file with pages keeps the normal rules under the disk limit" "$ATTEMPTS" 0
 : > "$SIGNAL_FILE"
@@ -419,7 +485,7 @@ RETIRE_CONFIG="$WORK/retire.conf"
 run_retire "$MEMORY_KIB" 0
 check "a limit of 0 turns the guard off" "$(wc -c < "$SIGNAL_FILE")" 0
 check_contains "status reports growth allowed" 'SWAP_GROWTH=ALLOWED' "$WORK/run/STATUS"
-kill "$SIGNAL_TARGET" 2>/dev/null; wait "$SIGNAL_TARGET" 2>/dev/null
+kill "$SIGNAL_TARGET" "$SIGNAL_BYSTANDER" 2>/dev/null; wait "$SIGNAL_TARGET" "$SIGNAL_BYSTANDER" 2>/dev/null
 
 echo "== CPU selectors follow the detected topology"
 # Each selector is checked against what the probe found on this machine.

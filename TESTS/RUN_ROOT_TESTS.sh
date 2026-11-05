@@ -282,6 +282,16 @@ say ""; say "== 6) Permission checks with real privileges"
 start_daemon "$WORK/d10.log" "$WORK/test.conf"
 if [ "$(stat -c '%u %a' "$WORK/run/focus.sock")" = "$USER_ID 600" ]; then pass "the focus socket belongs to the active seat user"; else fail "focus socket: $(stat -c '%u %a' "$WORK/run/focus.sock")"; fi
 if setpriv --reuid=65534 --regid=65534 --clear-groups python3 -I -c 'import socket,sys; s=socket.socket(socket.AF_UNIX,socket.SOCK_DGRAM); s.sendto(b"1",sys.argv[1])' "$WORK/run/focus.sock" 2>/dev/null; then fail "another user reached the focus socket"; else pass "another user cannot reach the focus socket"; fi
+as_user python3 -I -c 'import os,sys; os.chmod(sys.argv[1], 0o666)' "$WORK/run/focus.sock"
+sleep 2.5
+if [ "$(stat -c '%u %a' "$WORK/run/focus.sock")" = "$USER_ID 600" ]; then pass "a mode changed by the owner is replaced"; else fail "socket after chmod: $(stat -c '%u %a' "$WORK/run/focus.sock")"; fi
+echo "ACTIVE_UID=65534" > "$WORK/seats/seat0"
+sleep 2.5
+if [ "$(stat -c '%u %a' "$WORK/run/focus.sock")" = "65534 600" ]; then pass "the socket follows the active seat"; else fail "socket after seat change: $(stat -c '%u %a' "$WORK/run/focus.sock")"; fi
+rm "$WORK/seats/seat0"
+sleep 2.5
+if [ "$(stat -c '%u %a' "$WORK/run/focus.sock")" = "0 600" ]; then pass "without an active seat the socket returns to root"; else fail "socket without a seat: $(stat -c '%u %a' "$WORK/run/focus.sock")"; fi
+echo "ACTIVE_UID=$USER_ID" > "$WORK/seats/seat0"
 stop_daemon
 chmod 664 "$WORK/test.conf"
 setpriv "$BOUNDING" "$DAEMON" --config "$WORK/test.conf" --runtime-dir "$WORK/run" --seat-directory "$WORK/seats" > "$WORK/d7.log" 2>&1

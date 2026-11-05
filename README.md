@@ -24,19 +24,48 @@ it. The [LICENSE](LICENSE) has the full terms.
 
 ## Requirements
 
-| Need | Why |
-| --- | --- |
-| Linux 6.7 or newer, cgroup v2 | `PAGEMAP_SCAN`, `process_madvise` and `memory.reclaim` |
-| systemd with logind and user managers | Application groups under `app.slice`, and the active seat check |
-| GNOME 48 | The focus reporter. Without it no application becomes foreground, and only the background policy and swap return work. |
-| A C compiler and `make` | Building. `make test` also needs `python3`. |
-| `swapspace`, `zram-generator` | Only for `ENABLE_ENFORCE.sh` |
+The daemon uses no third-party libraries. At run time it links only to the C library. "Tested with" is
+the one machine this has run on, not a minimum.
+
+### To build
+
+| Need | Why | Tested with |
+| --- | --- | --- |
+| C compiler with C11 and GNU extensions | Builds the daemon. GCC 12 or newer is needed for `_FORTIFY_SOURCE=3` | GCC 14.2 |
+| GNU Make | Build steps | 4.4.1 |
+| C library headers | Standard and Linux system calls | glibc 2.41 |
+| Linux headers 6.7 or newer | `PAGEMAP_SCAN` in `<linux/fs.h>` | 7.2 |
+
+### To run
+
+| Need | Why | Tested with |
+| --- | --- | --- |
+| x86-64 | The page scan's address range is written for it | x86-64 |
+| Linux 6.7 or newer | `PAGEMAP_SCAN`, `process_madvise` and `memory.reclaim` | 7.2 |
+| Kernel options `CONFIG_MEMCG`, `CONFIG_SWAP`, `CONFIG_PROC_PAGE_MONITOR` and `CONFIG_PSI` | Limits, swap, page scan and memory pressure | Enabled |
+| Pressure information turned on | If `/proc/pressure/memory` is missing, the daemon treats the system as never calm, so it does no idle read and retires no swap file by itself. Add `psi=1` to the kernel command line if your kernel has it off by default | Available |
+| cgroup v2 with `memory_recursiveprot` | Protection must reach the groups inside an application. systemd usually mounts it this way | Enabled |
+| systemd with user managers and logind | Application groups under `app.slice`, and the active seat in `/run/systemd/seats` | 257 |
+| GNOME on Wayland | The focus reporter. Without it no application becomes foreground, and only the background policy and swap return work. The extension declares GNOME 48 only | 48.7 |
+
+### To enable the memory settings and run the scripts
+
+| Need | Used by | Tested with |
+| --- | --- | --- |
+| `swapspace` | `ENABLE_ENFORCE.sh`, for swap files. The disk limit works through it | 1.18 |
+| `zram-generator` | `ENABLE_ENFORCE.sh`, for the zram device | 1.2.1 |
+| A filesystem that `swapon` accepts files from | Swap files | ext4 |
+| `util-linux`: `runuser`, `setpriv`, `fallocate`, `mkswap`, `swapon`, `swapoff`, `taskset` | Scripts and tests | 2.41 |
+| `coreutils`, `awk`, `sed`, `getent` and `procps`: `sysctl`, `pgrep` | Scripts and tests | coreutils 9.7, gawk 5.2, procps 4.0 |
+| `python3` | Tests only | 3.13 |
 
 On Debian:
 
 ```sh
-sudo apt install build-essential python3 swapspace systemd-zram-generator
+sudo apt install build-essential linux-libc-dev python3 swapspace systemd-zram-generator
 ```
+
+The other tools come with a standard Debian system.
 
 If your kernel enables zswap by default, disable it with `zswap.enabled=0` on the kernel command line.
 It would compress pages twice on top of zram.
@@ -71,6 +100,65 @@ To undo:
 sudo sh SCRIPTS/DISABLE_ENFORCE.sh /var/backups/adaptive-resource-manager/<timestamp>
 sudo sh SCRIPTS/UNINSTALL.sh
 ```
+
+## Architecture
+
+```mermaid
+flowchart TB
+    subgraph SESSION["Desktop session of the active seat user"]
+        SHELL["GNOME Shell"]
+        EXTENSION["Focus Reporter extension"]
+        APPLICATIONS["Applications in app.slice"]
+        SHELL -- "focus changed" --> EXTENSION
+    end
+
+    subgraph CONFIGURATION["Configuration only root can change"]
+        POLICY["RESOURCE_POLICY.conf"]
+        TUNABLES["SYSTEM_TUNABLES.conf"]
+    end
+
+    subgraph SERVICES["System services"]
+        DAEMON["adaptive-resource-managerd<br/>sandboxed, five capabilities"]
+        APPLY["adaptive-resource-manager-tunables<br/>runs once at boot"]
+        SWAPSPACE["swapspace<br/>adds swap files on demand"]
+        GENERATOR["zram-generator<br/>creates zram at boot"]
+        LOGIND["systemd-logind<br/>active seat"]
+    end
+
+    subgraph KERNEL["Linux kernel"]
+        CGROUPS["cgroup v2<br/>memory and CPU limits"]
+        PROCFS["procfs<br/>page map, memory, pressure"]
+        SETTINGS["vm settings"]
+        ZRAM["zram<br/>first swap"]
+        FILES["Swap files on disk<br/>second swap"]
+    end
+
+    EXTENSION -- "process ID through focus.sock" --> DAEMON
+    LOGIND -- "who may report" --> DAEMON
+    POLICY --> DAEMON
+    TUNABLES --> APPLY
+    APPLY -- "sizes and thresholds" --> SWAPSPACE
+    APPLY --> SETTINGS
+    GENERATOR --> ZRAM
+    DAEMON -- "limits for each application" --> CGROUPS
+    CGROUPS --> APPLICATIONS
+    PROCFS -- "swapped pages, free memory, pressure" --> DAEMON
+    DAEMON -- "reads pages back into memory" --> APPLICATIONS
+    DAEMON -- "removes files when calm" --> FILES
+    DAEMON -- "stops growth near the disk limit" --> SWAPSPACE
+    SWAPSPACE -- "adds files when swap runs short" --> FILES
+```
+
+The daemon itself is split by responsibility:
+
+| File | Responsibility |
+| --- | --- |
+| `SOURCE/main.c` | Main loop, focus socket, sender checks and status file |
+| `SOURCE/app_groups.c` | Finding application groups, writing their limits and saving the original values |
+| `SOURCE/readback.c` | Finding swapped pages, paced reads, releasing pages, removing swap files and the disk limit |
+| `SOURCE/system_info.c` | Finding CPU classes, swap devices, backing disks and GPU use |
+| `SOURCE/config.c` | Reading and validating the policy |
+| `SOURCE/util.c` | File, path, seat and kernel statistics helpers |
 
 ## Repository
 
@@ -160,13 +248,13 @@ other processes' pages are swapped, never the contents of their memory.
 
 | Input | Check |
 | --- | --- |
-| Focus socket | Mode 600 and owned by the user at the active seat, so other users cannot fill its queue. The kernel supplies the sender's identity. The sender must be that user, and the process and group must belong to the sender. Other reports have no effect, and logging them is rate limited. |
+| Focus socket | Mode 600 and owned by the user at the active seat, or by root without one, so other users cannot fill its queue. A socket with the wrong owner or mode is replaced within about a second, which also drops anyone connected to the old one. The kernel supplies the sender's identity. The sender must be that user, and the process and group must belong to the sender. Other reports have no effect, and logging them is rate limited. |
 | Group names, which users choose | Only `user.slice/user-UID.slice/user@UID.service/app.slice/UNIT` with a valid unit name is accepted. This keeps line breaks and forged fields out of logs and saved limits. |
 | `RESOURCE_POLICY.conf` | As root, it must be a regular file, not a link, that only root can change. Unknown keys and invalid values stop the daemon. |
 | `SYSTEM_TUNABLES.conf` | Same ownership rule. It is read as values and never executed. |
 | Runtime directory | It must not be a link, and only the daemon's user may change it. Saved limits there are mode 600, and restored paths must be real application groups. |
 | Swap files | Before `swapoff` and `unlink`, each file must be a regular file, not a link, directly inside a directory, and both must be changeable only by the daemon's user. |
-| Memory use | Scan results and groups are capped, at 512 per user and 4096 in total, with room always kept for the user at the active seat. The unit has `MemoryMax=1%`. |
+| Memory use | Scan results and groups are capped: 512 groups per user, 3584 for all users without the active seat together, and 8192 in the table. A group that still exists is never dropped, so it keeps its original limits. The unit has `MemoryMax=1%`. |
 | Cgroup files | Reads and writes do not follow links, in addition to cgroup v2 not allowing them. |
 | Status file | Every local user can read it, so it names no application. |
 | Scripts | `INSTALL.sh` and `UNINSTALL.sh` work in the user's home as that user, not as root. `DISABLE_ENFORCE.sh` restores only from a root-owned backup directory, and only under `/etc` and `/usr/local`. |
@@ -179,6 +267,9 @@ What this does not protect against:
 - Any program of the user at the active seat can report a false focus and give one of that user's
   applications priority. The compositor offers no proof of which window really has focus.
 - A remote login of the user at the active seat counts as that user.
+- The user at the active seat can open the socket between two checks and let another user connect. That
+  sender stays connected until the socket is next replaced and can fill its queue, but this harms only that
+  seat user's own reports.
 - `sudo sh SCRIPTS/...` runs files from a directory you own. Anything running as your user could change
   them first, so check `git status` and install from a clean state.
 - Swap files are not encrypted by this software. Memory contents can reach the disk unless the disk itself
@@ -196,7 +287,8 @@ To report a security problem, contact the maintainer through GitHub before publi
   pages can stay in memory until the total rises. `RUN_ROOT_TESTS.sh` may turn it off while it runs.
 - Without zram, the last swap file stays because no other swap would remain.
 - The disk limit only stops swap files. Other programs can still fill the disk.
-- Any local user who fills the disk also stops swap growth, and processes can then be killed earlier.
+- Any local user who fills the disk also stops swap growth and sends empty swap files back, and processes
+  can then be killed earlier.
 - On a machine with several seats, only the user of the first active seat can report focus.
 - The disk limit works through swapspace's `SIGUSR2`. Another swap manager is not held back.
 - The kernel allows about 23 swap files besides zram. After that swapspace cannot add space, and the

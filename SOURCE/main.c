@@ -20,7 +20,7 @@
 #define DEFAULT_SEAT_DIRECTORY "/run/systemd/seats"
 #define MAX_FOCUS_REPORTS_PER_POLL 32
 #define REJECTED_REPORT_LOG_INTERVAL_SECONDS 1.0
-#define FOCUS_SOCKET_OWNER_CHECK_SECONDS 1.0
+#define FOCUS_SOCKET_CHECK_SECONDS 1.0
 #define FOCUS_SOCKET_NAME "focus.sock"
 #define STATUS_FILE_NAME "STATUS"
 #define GROUP_REFRESH_INTERVAL_SECONDS 5.0
@@ -44,55 +44,62 @@ static void handle_stop_signal(int signal_number) {
     g_stop = 1;
 }
 
-static int open_focus_socket(void) {
+// Built under a temporary name and moved into place. Closing the socket it replaces drops every sender
+// connected to the old one, because permissions are only checked when a sender connects.
+static int open_focus_socket(uid_t owner) {
     int descriptor = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
-    if (descriptor < 0) {
-        perror("socket");
-        return -1;
-    }
+    if (descriptor < 0) return -1;
     struct sockaddr_un address;
+    char final_path[sizeof address.sun_path];
     memset(&address, 0, sizeof address);
     address.sun_family = AF_UNIX;
-    int length = snprintf(address.sun_path, sizeof address.sun_path, "%s/%s", g_paths.runtime_directory, FOCUS_SOCKET_NAME);
-    if (length < 0 || (size_t)length >= sizeof address.sun_path) {
-        fprintf(stderr, "Runtime directory path is too long\n");
+    int final_length = snprintf(final_path, sizeof final_path, "%s/%s", g_paths.runtime_directory, FOCUS_SOCKET_NAME);
+    int length = snprintf(address.sun_path, sizeof address.sun_path, "%s/%s.new", g_paths.runtime_directory, FOCUS_SOCKET_NAME);
+    if (final_length < 0 || (size_t)final_length >= sizeof final_path || length < 0 || (size_t)length >= sizeof address.sun_path) {
         close(descriptor);
-        return -1;
-    }
-    unlink(address.sun_path);
-    if (bind(descriptor, (struct sockaddr *)&address, sizeof address) != 0) {
-        perror("bind");
-        close(descriptor);
-        return -1;
-    }
-    // Only the owner can send, and update_focus_socket_owner makes the active seat user the owner.
-    if (chmod(address.sun_path, 0600) != 0) {
-        perror("chmod");
-        close(descriptor);
+        errno = ENAMETOOLONG;
         return -1;
     }
     int enabled = 1;
-    if (setsockopt(descriptor, SOL_SOCKET, SO_PASSCRED, &enabled, sizeof enabled) != 0) {
-        perror("SO_PASSCRED");
+    unlink(address.sun_path);
+    // Credentials are on before anyone can reach the socket, so no datagram arrives without them.
+    if (setsockopt(descriptor, SOL_SOCKET, SO_PASSCRED, &enabled, sizeof enabled) != 0 ||
+        bind(descriptor, (struct sockaddr *)&address, sizeof address) != 0 || chmod(address.sun_path, 0600) != 0 ||
+        (owner != geteuid() && chown(address.sun_path, owner, (gid_t)-1) != 0) || rename(address.sun_path, final_path) != 0) {
+        int saved_error = errno;
+        unlink(address.sun_path);
         close(descriptor);
+        errno = saved_error;
         return -1;
     }
     return descriptor;
 }
 
 // A socket every local user could reach would let any of them fill its queue and block the reports of
-// the active user. Without logind's seat data the owner stays root, so nobody can send.
-static void update_focus_socket_owner(double now) {
+// the active user, so only that user owns it, and without an active seat this daemon does. The owner can
+// change the mode, and this daemon cannot change it back without another capability, so a socket with
+// the wrong owner or mode is replaced. A failed attempt runs again at the next check.
+static void update_focus_socket(int *descriptor, double now) {
     static double next_check_at;
-    static uid_t current_owner = (uid_t)-1;
+    static uid_t failed_owner = (uid_t)-1;
     if (now < next_check_at) return;
-    next_check_at = now + FOCUS_SOCKET_OWNER_CHECK_SECONDS;
+    next_check_at = now + FOCUS_SOCKET_CHECK_SECONDS;
     uid_t seats[MAX_SEATS];
-    if (!active_seat_uids(seats, MAX_SEATS) || seats[0] == current_owner) return;
+    uid_t owner = active_seat_uids(seats, MAX_SEATS) ? seats[0] : geteuid();
     char path[PATH_BUFFER_SIZE + 32];
+    struct stat info;
     snprintf(path, sizeof path, "%s/%s", g_paths.runtime_directory, FOCUS_SOCKET_NAME);
-    if (chown(path, seats[0], (gid_t)-1) != 0) log_event("event=FOCUS_SOCKET_OWNER_FAILED uid=%u error=\"%s\"", (unsigned)seats[0], strerror(errno));
-    current_owner = seats[0];
+    if (lstat(path, &info) == 0 && S_ISSOCK(info.st_mode) && info.st_uid == owner && (info.st_mode & 07777) == 0600) return;
+    int replacement = open_focus_socket(owner);
+    if (replacement < 0) {
+        if (owner != failed_owner) log_event("event=FOCUS_SOCKET_REPLACE_FAILED uid=%u error=\"%s\"", (unsigned)owner, strerror(errno));
+        failed_owner = owner;
+        return;
+    }
+    close(*descriptor);
+    *descriptor = replacement;
+    failed_owner = (uid_t)-1;
+    log_event("event=FOCUS_SOCKET_REPLACED uid=%u", (unsigned)owner);
 }
 
 // A flood of bad reports must not fill the journal.
@@ -246,8 +253,11 @@ static int run_daemon(void) {
         fprintf(stderr, "Refusing runtime directory %s: it must be a directory that only this user can change\n", g_paths.runtime_directory);
         return 1;
     }
-    int focus_socket = open_focus_socket();
-    if (focus_socket < 0) return 1;
+    int focus_socket = open_focus_socket(geteuid());
+    if (focus_socket < 0) {
+        perror("focus socket");
+        return 1;
+    }
     struct sigaction action;
     memset(&action, 0, sizeof action);
     action.sa_handler = handle_stop_signal;
@@ -268,7 +278,8 @@ static int run_daemon(void) {
     struct pollfd poll_entry = {.fd = focus_socket, .events = POLLIN};
     while (!g_stop) {
         double now = monotonic_seconds();
-        update_focus_socket_owner(now);
+        update_focus_socket(&focus_socket, now);
+        poll_entry.fd = focus_socket;
         double wait = readback_next_due_seconds(now);
         if (pending) {
             double remaining = pending_since + g_policy.focus_debounce_milliseconds / 1000.0 - now;

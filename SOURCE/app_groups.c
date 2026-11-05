@@ -15,13 +15,16 @@
 #define CPU_PERIOD_MICROSECONDS 100000LL
 #define CPU_WEIGHT_MAXIMUM 10000LL
 #define CPU_WEIGHT_MINIMUM 1LL
-#define MAX_APP_GROUPS 4096
 #define MAX_APP_GROUPS_PER_USER 512
+#define MAX_APP_GROUPS_OF_OTHER_USERS 3584
+// Only a change of the active seat can take the table past the two limits above.
+#define MAX_APP_GROUPS_TOTAL 8192
 #define MAX_ENTRIES_EXAMINED_PER_USER (MAX_APP_GROUPS_PER_USER * 4)
 #define MAX_GROUP_PATH_LENGTH 600
 
 struct app_group {
     char path[PATH_BUFFER_SIZE];
+    uid_t owner;
     long long original_memory_high;
     long long original_memory_max;
     long long original_swap_max;
@@ -332,8 +335,9 @@ void app_groups_load_saved_originals(void) {
         // Limits are written back to these paths, so only real application groups are accepted.
         struct stat info;
         uid_t owner;
-        if (!group_path_is_valid(separator + 1, &owner) || g_group_count >= MAX_APP_GROUPS || stat(separator + 1, &info) != 0) continue;
+        if (!group_path_is_valid(separator + 1, &owner) || g_group_count >= MAX_APP_GROUPS_TOTAL || stat(separator + 1, &info) != 0) continue;
         struct app_group *group = group_add(separator + 1);
+        group->owner = owner;
         group->original_memory_high = high;
         group->original_memory_max = max;
         group->original_swap_max = swap;
@@ -362,15 +366,28 @@ static void group_record_originals(struct app_group *group) {
     read_text_file(path, group->original_cpu_max, sizeof group->original_cpu_max);
 }
 
-// A user can create directories without limit, so the work and memory for each user are capped. Other
+static bool uid_in_list(uid_t uid, const uid_t *uids, int count) {
+    for (int i = 0; i < count; i++) {
+        if (uids[i] == uid) return true;
+    }
+    return false;
+}
+
+// A user can create directories without limit, so the work and memory for each user are capped. Every
+// kept group counts, seen by this scan or not, because groups stay in the table while they exist. Other
 // users also leave room for the user at an active seat, so they cannot crowd out that user's applications.
-static bool refresh_groups_of_user(unsigned uid, bool has_seat) {
+static bool refresh_groups_of_user(unsigned uid, const uid_t *seats, int seat_count) {
     char slice[PATH_BUFFER_SIZE];
     int length = snprintf(slice, sizeof slice, "%s/user.slice/user-%u.slice/user@%u.service/app.slice", g_paths.cgroup_root, uid, uid);
     if (length < 0 || (size_t)length >= sizeof slice) return false;
     DIR *directory = opendir(slice);
     if (!directory) return false;
-    int limit = has_seat ? MAX_APP_GROUPS : MAX_APP_GROUPS - MAX_APP_GROUPS_PER_USER;
+    bool has_seat = uid_in_list((uid_t)uid, seats, seat_count);
+    int owned = 0, other_users = 0;
+    for (int i = 0; i < g_group_count; i++) {
+        if (g_groups[i].owner == (uid_t)uid) owned++;
+        if (!uid_in_list(g_groups[i].owner, seats, seat_count)) other_users++;
+    }
     int groups = 0, examined = 0;
     bool changed = false;
     struct dirent *entry;
@@ -382,13 +399,16 @@ static bool refresh_groups_of_user(unsigned uid, bool has_seat) {
         if (!join_child_path(path, sizeof path, slice, entry->d_name) || !group_path_is_valid(path, &owner)) continue;
         struct app_group *group = group_find(path);
         if (!group) {
-            if (g_group_count >= limit) {
+            if (owned >= MAX_APP_GROUPS_PER_USER || g_group_count >= MAX_APP_GROUPS_TOTAL || (!has_seat && other_users >= MAX_APP_GROUPS_OF_OTHER_USERS)) {
                 static bool limit_logged;
-                if (!limit_logged) log_event("event=GROUP_LIMIT_REACHED limit=%d", limit);
+                if (!limit_logged) log_event("event=GROUP_LIMIT_REACHED uid=%u owned=%d total=%d", uid, owned, g_group_count);
                 limit_logged = true;
                 break;
             }
             group = group_add(path);
+            group->owner = owner;
+            owned++;
+            if (!has_seat) other_users++;
             group_record_originals(group);
             apply_background(group);
             changed = true;
@@ -408,7 +428,7 @@ static bool refresh_groups_of_all_users(void) {
     int seat_count = active_seat_uids(seats, MAX_SEATS);
     bool changed = false;
     for (int i = 0; i < seat_count; i++) {
-        if (refresh_groups_of_user((unsigned)seats[i], true)) changed = true;
+        if (refresh_groups_of_user((unsigned)seats[i], seats, seat_count)) changed = true;
     }
     char path[PATH_BUFFER_SIZE];
     if (!join_child_path(path, sizeof path, g_paths.cgroup_root, "user.slice")) return changed;
@@ -419,11 +439,7 @@ static bool refresh_groups_of_all_users(void) {
         unsigned uid;
         int consumed = -1;
         if (sscanf(entry->d_name, "user-%u.slice%n", &uid, &consumed) != 1 || consumed < 0 || entry->d_name[consumed]) continue;
-        bool has_seat = false;
-        for (int i = 0; i < seat_count; i++) {
-            if ((unsigned)seats[i] == uid) has_seat = true;
-        }
-        if (!has_seat && refresh_groups_of_user(uid, false)) changed = true;
+        if (!uid_in_list((uid_t)uid, seats, seat_count) && refresh_groups_of_user(uid, seats, seat_count)) changed = true;
     }
     closedir(directory);
     return changed;
@@ -434,10 +450,12 @@ void app_groups_refresh(void) {
     if (g_foreground) snprintf(foreground_path, sizeof foreground_path, "%s", g_foreground->path);
     for (int i = 0; i < g_group_count; i++) g_groups[i].seen = false;
     bool changed = refresh_groups_of_all_users();
-    // Remove groups that no longer exist.
+    // Remove only groups that are gone. A scan that stopped at a limit proves nothing about the rest, and
+    // dropping a live group would lose its original limits.
     int kept = 0;
     for (int i = 0; i < g_group_count; i++) {
-        if (g_groups[i].seen) g_groups[kept++] = g_groups[i];
+        struct stat info;
+        if (g_groups[i].seen || stat(g_groups[i].path, &info) == 0) g_groups[kept++] = g_groups[i];
         else changed = true;
     }
     g_group_count = kept;

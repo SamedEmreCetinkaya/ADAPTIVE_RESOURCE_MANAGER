@@ -41,6 +41,7 @@
 #define SCAN_MEMORY_PERCENT_OF_MEMORY 0.25
 #define DISK_GUARD_INTERVAL_SECONDS 1.0
 #define SWAP_MANAGER_PROCESSES "/system.slice/swapspace.service/cgroup.procs"
+#define SWAP_MANAGER_NAME "swapspace"
 
 #ifndef SYS_pidfd_open
 #define SYS_pidfd_open 434
@@ -121,7 +122,10 @@ static void hold_swap_growth(void) {
     if (!file) return;
     int pid;
     while (fscanf(file, "%d", &pid) == 1) {
-        if (pid > 1) kill(pid, SIGUSR2);
+        // A helper such as mkswap has no handler, and this signal would end it.
+        char name_path[64], name[32];
+        snprintf(name_path, sizeof name_path, "/proc/%d/comm", pid);
+        if (pid > 1 && read_text_file(name_path, name, sizeof name) && !strcmp(name, SWAP_MANAGER_NAME)) kill(pid, SIGUSR2);
     }
     fclose(file);
 }
