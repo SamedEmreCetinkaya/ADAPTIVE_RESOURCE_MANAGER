@@ -1,0 +1,5 @@
+# Build output
+BUILD/
+
+# Logs of each machine's test runs. Kernel logs can contain device and personal details.
+TESTS/RESULTS/

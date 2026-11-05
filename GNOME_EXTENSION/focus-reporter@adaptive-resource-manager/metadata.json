@@ -1,0 +1,7 @@
+{
+  "uuid": "focus-reporter@adaptive-resource-manager",
+  "name": "Focus Reporter",
+  "description": "Reports the process ID of the focused window to adaptive-resource-managerd. Sends no window titles.",
+  "shell-version": ["48"],
+  "version": 1
+}
