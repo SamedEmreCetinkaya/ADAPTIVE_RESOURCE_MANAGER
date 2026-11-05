@@ -56,6 +56,8 @@ static const struct key_definition KEY_DEFINITIONS[] = {
     PERCENT_KEY("SWAP_FILE_RETIRE_UNREACHABLE_PERCENT", swap_file_retire_unreachable_percent, 0, 100),
     PERCENT_KEY("SWAP_FILE_RETIRE_WORST_CASE_READ_PERCENT", swap_file_retire_worst_case_read_percent, 0, 100),
     PERCENT_KEY("SWAP_FILE_RETIRE_MIN_FREE_SWAP_PERCENT", swap_file_retire_min_free_swap_percent, 0, 100),
+    PERCENT_KEY("SWAP_FILE_MIN_FREE_DISK_PERCENT", swap_file_min_free_disk_percent, 0, 100),
+    PERCENT_KEY("SWAP_FILE_GROWTH_MARGIN_PERCENT_OF_MEMORY", swap_file_growth_margin_percent_of_memory, 0, 100),
     {"SWAP_FILE_DIRECTORY", KEY_STRING, offsetof(struct policy_config, swap_file_directory), 0, 0},
 };
 
@@ -91,6 +93,8 @@ void policy_set_defaults(void) {
     g_policy.swap_file_retire_unreachable_percent = 1.00;
     g_policy.swap_file_retire_worst_case_read_percent = 5.00;
     g_policy.swap_file_retire_min_free_swap_percent = 30.00;
+    g_policy.swap_file_min_free_disk_percent = 5.00;
+    g_policy.swap_file_growth_margin_percent_of_memory = 13.00;
     snprintf(g_policy.swap_file_directory, sizeof g_policy.swap_file_directory, "/var/lib/swapspace");
 }
 
@@ -247,6 +251,8 @@ void policy_print(void) {
     print_memory_share("SWAP_FILE_RETIRE_UNREACHABLE", g_policy.swap_file_retire_unreachable_percent);
     print_memory_share("SWAP_FILE_RETIRE_WORST_CASE_READ", g_policy.swap_file_retire_worst_case_read_percent);
     print_memory_share("SWAP_FILE_RETIRE_MIN_FREE_SWAP", g_policy.swap_file_retire_min_free_swap_percent);
+    printf("SWAP_FILE_MIN_FREE_DISK_PERCENT=%.2f\n", g_policy.swap_file_min_free_disk_percent);
+    print_memory_share("SWAP_FILE_GROWTH_MARGIN", g_policy.swap_file_growth_margin_percent_of_memory);
     printf("FOREGROUND_CPU_SET=%s\nBACKGROUND_CPU_SET=%s\n",
            cpu_selector_name(&g_policy.foreground_cpu_set, foreground, sizeof foreground),
            cpu_selector_name(&g_policy.background_cpu_set, background, sizeof background));

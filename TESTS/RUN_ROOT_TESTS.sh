@@ -32,12 +32,17 @@ mkfifo "$WORK/commands"
 FAILURES=0
 DAEMON_PID=""
 HOLDER_PID=""
-BOUNDING="--bounding-set=-all,+sys_admin,+sys_nice,+sys_ptrace,+dac_override"
+BOUNDING="--bounding-set=-all,+sys_admin,+sys_nice,+sys_ptrace,+dac_override,+chown"
 SERVICE=adaptive-resource-manager.service
 SERVICE_WAS_ACTIVE=0
+# Some kernels refuse to reclaim anonymous memory below this share of memory. The test turns it off only
+# when it would get in the way, and restores it on exit.
+ANON_FLOOR_FILE=/proc/sys/vm/anon_min_ratio
+ANON_FLOOR_BEFORE=""
 
 cleanup() {
     trap - EXIT INT TERM HUP
+    [ -n "$ANON_FLOOR_BEFORE" ] && echo "$ANON_FLOOR_BEFORE" > "$ANON_FLOOR_FILE"
     [ -n "$DAEMON_PID" ] && kill "$DAEMON_PID" 2>/dev/null
     [ -n "$HOLDER_PID" ] && kill "$HOLDER_PID" 2>/dev/null
     exec 3>&- 2>/dev/null
@@ -72,6 +77,13 @@ create_swap() {
 }
 remove_swap() { swapoff "$SWAP_FILE" 2>/dev/null; rm -f "$SWAP_FILE"; }
 holder_command() { printf '%s' "$1" >&3; }
+anon_lru_mib() { awk '/^Active\(anon\):/{a=$2} /^Inactive\(anon\):/{i=$2} END{print int((a+i)/1024)}' /proc/meminfo; }
+turn_off_anon_floor() {
+    [ -z "$ANON_FLOOR_BEFORE" ] && [ -w "$ANON_FLOOR_FILE" ] || return 1
+    ANON_FLOOR_BEFORE=$(cat "$ANON_FLOOR_FILE")
+    say "Kernel anonymous memory floor off for this test: was $ANON_FLOOR_BEFORE% = $(( MEMORY_MIB * ANON_FLOOR_BEFORE / 100 )) MiB, anonymous memory $(anon_lru_mib) MiB, group cache $(group_cached_mib) MiB"
+    echo 0 > "$ANON_FLOOR_FILE"
+}
 # Pages must leave the swap cache or the next read never touches the disk.
 page_out_fully() {
     holder_command p
@@ -79,13 +91,16 @@ page_out_fully() {
     while [ "${disk:-0}" -lt $(( HOLD_MIB * 85 / 100 )) ] && [ $i -lt 40 ]; do sleep 0.25; disk=$(disk_used_mib); i=$((i + 1)); done
     disk=0
     i=0
-    while [ $i -lt 10 ]; do
+    # Pages cannot leave the cache while the disk is still writing them, which can take many seconds.
+    while [ $i -lt 100 ]; do
         printf '%s' $(( HOLD_MIB * 1048576 )) > "$GROUP/memory.reclaim" 2>/dev/null
         [ "$(group_cached_mib)" -le 8 ] && break
+        [ $i = 20 ] && turn_off_anon_floor
         sleep 0.3
         i=$((i + 1))
     done
     say "Prepared: disk $(disk_used_mib) MiB, group cache $(group_cached_mib) MiB"
+    [ "$(group_cached_mib)" -le 8 ] || fail "test preparation: pages stayed in the cache, so the next result is not a real disk read"
 }
 verify_data() {
     before=$(grep -c VERIFY "$WORK/holder.out")
@@ -113,6 +128,7 @@ BACKGROUND_CPU_WEIGHT_PERCENT=100
 BACKGROUND_CPU_QUOTA_PERCENT=100
 SWAP_FILE_DIRECTORY=$SWAP_DIRECTORY
 SWAP_FILE_RETIRE_MIN_FREE_SWAP_PERCENT=0
+SWAP_FILE_MIN_FREE_DISK_PERCENT=0
 $1
 EOF
 }
@@ -188,6 +204,8 @@ verify_data "idle readback"
 stop_daemon
 
 say ""; say "== 4) Idle readback stops and releases its pages when memory is needed"
+# This step checks the daemon's release, which that floor could block.
+turn_off_anon_floor
 [ -e "$SWAP_FILE" ] || create_swap
 AVAILABLE=$(available_mib)
 RESERVE_MIB=$(( AVAILABLE - MEMORY_MIB / 10 ))
@@ -261,6 +279,10 @@ verify_data "retiring a file whose pages are in memory"
 stop_daemon
 
 say ""; say "== 6) Permission checks with real privileges"
+start_daemon "$WORK/d10.log" "$WORK/test.conf"
+if [ "$(stat -c '%u %a' "$WORK/run/focus.sock")" = "$USER_ID 600" ]; then pass "the focus socket belongs to the active seat user"; else fail "focus socket: $(stat -c '%u %a' "$WORK/run/focus.sock")"; fi
+if setpriv --reuid=65534 --regid=65534 --clear-groups python3 -I -c 'import socket,sys; s=socket.socket(socket.AF_UNIX,socket.SOCK_DGRAM); s.sendto(b"1",sys.argv[1])' "$WORK/run/focus.sock" 2>/dev/null; then fail "another user reached the focus socket"; else pass "another user cannot reach the focus socket"; fi
+stop_daemon
 chmod 664 "$WORK/test.conf"
 setpriv "$BOUNDING" "$DAEMON" --config "$WORK/test.conf" --runtime-dir "$WORK/run" --seat-directory "$WORK/seats" > "$WORK/d7.log" 2>&1
 if [ "$?" = 2 ]; then pass "refuses a configuration others can change"; else fail "started with a configuration others can change"; fi

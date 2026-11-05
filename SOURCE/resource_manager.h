@@ -7,6 +7,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <sys/types.h>
 
 #define PATH_BUFFER_SIZE 640
@@ -14,6 +15,7 @@
 #define LIMIT_UNLIMITED (-1LL)
 #define MAX_BACKING_DISKS 8
 #define MAX_SWAP_FILES 32
+#define MAX_SEATS 8
 
 enum run_mode { RUN_MODE_OBSERVE, RUN_MODE_ENFORCE };
 
@@ -61,6 +63,8 @@ struct policy_config {
     double swap_file_retire_unreachable_percent;
     double swap_file_retire_worst_case_read_percent;
     double swap_file_retire_min_free_swap_percent;
+    double swap_file_min_free_disk_percent;
+    double swap_file_growth_margin_percent_of_memory;
     char swap_file_directory[PATH_BUFFER_SIZE];
 };
 
@@ -143,6 +147,9 @@ void log_event(const char *format, ...) __attribute__((format(printf, 1, 2)));
 void sanitize_log_text(char *text);
 bool join_child_path(char *buffer, size_t size, const char *parent, const char *name);
 bool path_is_trusted(const char *path, bool directory);
+int active_seat_uids(uid_t *uids, int capacity);
+bool uid_has_active_seat(uid_t uid);
+FILE *open_for_reading(const char *path);
 bool read_text_file(const char *path, char *buffer, size_t buffer_size);
 long long read_limit_file(const char *path, long long fallback);
 long long read_keyed_value(const char *path, const char *key, long long fallback);
@@ -188,6 +195,7 @@ enum readback_kind { READBACK_NONE, READBACK_FOREGROUND, READBACK_IDLE };
 void readback_start_foreground(const char *group_path);
 void readback_cancel(void);
 void readback_tick(double now);
+void readback_disk_guard_tick(double now);
 double readback_next_due_seconds(double now);
 enum readback_kind readback_active_kind(void);
 void readback_measure_group(const char *group_path, struct group_swap_counts *counts, uint64_t *gpu_bytes);

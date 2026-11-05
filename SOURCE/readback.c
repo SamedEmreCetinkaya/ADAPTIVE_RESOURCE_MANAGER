@@ -9,11 +9,13 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/fs.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/statvfs.h>
 #include <sys/swap.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
@@ -37,6 +39,8 @@
 #define RETIRE_RETRY_DELAY_SECONDS 60.0
 #define CGROUP_HEADROOM_CHUNKS 16
 #define SCAN_MEMORY_PERCENT_OF_MEMORY 0.25
+#define DISK_GUARD_INTERVAL_SECONDS 1.0
+#define SWAP_MANAGER_PROCESSES "/system.slice/swapspace.service/cgroup.procs"
 
 #ifndef SYS_pidfd_open
 #define SYS_pidfd_open 434
@@ -99,7 +103,50 @@ static double g_idle_calm_since;
 static double g_idle_not_before;
 static double g_retire_not_before;
 
+static struct {
+    bool growth_held;   // Free disk is too close to the limit for swapspace to add another file.
+    bool below_limit;   // Free disk is under the limit. Empty swap files go back at once.
+    double next_check_at;
+} g_disk_guard;
+
 static bool enforcing(void) { return g_policy.run_mode == RUN_MODE_ENFORCE; }
+
+// Only root can place a process in this systemd group, so its members cannot be forged. SIGUSR2 makes
+// swapspace free unneeded files and add none for one cooldown period, the same as running out of disk.
+static void hold_swap_growth(void) {
+    char path[PATH_BUFFER_SIZE + 64];
+    int length = snprintf(path, sizeof path, "%s%s", g_paths.cgroup_root, SWAP_MANAGER_PROCESSES);
+    if (length < 0 || (size_t)length >= sizeof path || !path_is_trusted(path, false)) return;
+    FILE *file = open_for_reading(path);
+    if (!file) return;
+    int pid;
+    while (fscanf(file, "%d", &pid) == 1) {
+        if (pid > 1) kill(pid, SIGUSR2);
+    }
+    fclose(file);
+}
+
+// Swap growth stops early enough that even the largest new file cannot take free disk below the limit.
+// The signal repeats, because swapspace would otherwise start adding files again after its cooldown.
+void readback_disk_guard_tick(double now) {
+    if (!enforcing() || g_policy.swap_file_min_free_disk_percent <= 0 || now < g_disk_guard.next_check_at) return;
+    g_disk_guard.next_check_at = now + DISK_GUARD_INTERVAL_SECONDS;
+    struct statvfs disk;
+    if (statvfs(g_policy.swap_file_directory, &disk) != 0) {
+        g_disk_guard.growth_held = g_disk_guard.below_limit = false;
+        return;
+    }
+    uint64_t free_bytes = (uint64_t)disk.f_bavail * disk.f_frsize;
+    uint64_t limit = percent_of((uint64_t)disk.f_blocks * disk.f_frsize, g_policy.swap_file_min_free_disk_percent);
+    bool held = free_bytes < limit + percent_of(g_system.memory_total_bytes, g_policy.swap_file_growth_margin_percent_of_memory);
+    if (held != g_disk_guard.growth_held) {
+        log_event("event=SWAP_GROWTH_%s free_disk_mib=%llu limit_mib=%llu", held ? "HELD" : "ALLOWED",
+                  (unsigned long long)(free_bytes / MEBIBYTE), (unsigned long long)(limit / MEBIBYTE));
+    }
+    g_disk_guard.growth_held = held;
+    g_disk_guard.below_limit = free_bytes < limit;
+    if (held) hold_swap_growth();
+}
 
 static void scan_free(struct scan_result *scan) {
     for (size_t i = 0; i < scan->target_count; i++) free(scan->targets[i].ranges);
@@ -153,7 +200,7 @@ static void read_process_cgroup(pid_t pid, char *cgroup, size_t size) {
     // A path that does not fit in one line, or that climbs upward, is not used at all.
     if (fgets(text, sizeof text, file) && !strncmp(text, "0::", 3) && strchr(text, '\n') && !strstr(text, "/..")) {
         text[strcspn(text, "\n")] = '\0';
-        snprintf(cgroup, size, "%.620s", text + 3);
+        snprintf(cgroup, size, "%s", text + 3);
     }
     fclose(file);
 }
@@ -240,7 +287,7 @@ static void scan_process(struct scan_result *scan, pid_t pid, bool include_zram)
 static void scan_group_tree(struct scan_result *scan, const char *directory_path, bool include_zram) {
     char path[PATH_BUFFER_SIZE];
     if (!join_child_path(path, sizeof path, directory_path, "cgroup.procs")) return;
-    FILE *file = fopen(path, "r");
+    FILE *file = open_for_reading(path);
     if (file) {
         int pid;
         while (fscanf(file, "%d", &pid) == 1) scan_process(scan, pid, include_zram);
@@ -289,7 +336,7 @@ static uint64_t gpu_memory_of_group_tree(const char *directory_path) {
     uint64_t total = 0;
     char path[PATH_BUFFER_SIZE];
     if (!join_child_path(path, sizeof path, directory_path, "cgroup.procs")) return 0;
-    FILE *file = fopen(path, "r");
+    FILE *file = open_for_reading(path);
     if (file) {
         int pid;
         while (fscanf(file, "%d", &pid) == 1) total += gpu_memory_bytes_of_process(pid);
@@ -570,11 +617,15 @@ static void retire_small_file(double now) {
     uint64_t cached = swap_cached_bytes();
     uint64_t expected_read = used > cached ? used - cached : 0;
     uint64_t reserve = percent_of(g_system.memory_total_bytes, g_policy.idle_readback_reserve_percent);
-    if (used > percent_of(g_system.memory_total_bytes, g_policy.swap_file_retire_worst_case_read_percent) ||
-        expected_read > percent_of(g_system.memory_total_bytes, g_policy.swap_file_retire_unreachable_percent) ||
-        !enough_swap_without(&layout, smallest) || memory_available_bytes() < reserve + expected_read ||
-        read_pressure("/proc/pressure/memory").some_average_10s >= g_policy.idle_pressure_stop_percent) {
-        return;
+    // Under the disk limit an empty file goes back whatever memory is doing: removing it reads nothing.
+    bool empty_on_full_disk = g_disk_guard.below_limit && used == 0;
+    if (!empty_on_full_disk) {
+        if (used > percent_of(g_system.memory_total_bytes, g_policy.swap_file_retire_worst_case_read_percent) ||
+            expected_read > percent_of(g_system.memory_total_bytes, g_policy.swap_file_retire_unreachable_percent) ||
+            !enough_swap_without(&layout, smallest) || memory_available_bytes() < reserve + expected_read ||
+            read_pressure("/proc/pressure/memory").some_average_10s >= g_policy.idle_pressure_stop_percent) {
+            return;
+        }
     }
     if (!retire_swap_file(smallest)) g_retire_not_before = now + RETIRE_RETRY_DELAY_SECONDS;
 }
@@ -745,6 +796,7 @@ enum readback_kind readback_active_kind(void) { return g_job.kind; }
 
 void readback_status_text(char *buffer, size_t buffer_size) {
     static const char *const NAMES[] = {"NONE", "FOREGROUND", "IDLE"};
-    snprintf(buffer, buffer_size, "READBACK=%s READBACK_ISSUED_MIB=%llu READBACK_RATE_MIB_PER_SECOND=%.0f", NAMES[g_job.kind],
+    snprintf(buffer, buffer_size, "SWAP_GROWTH=%s READBACK=%s READBACK_ISSUED_MIB=%llu READBACK_RATE_MIB_PER_SECOND=%.0f",
+             g_disk_guard.growth_held ? "HELD" : "ALLOWED", NAMES[g_job.kind],
              (unsigned long long)(g_job.issued_bytes / MEBIBYTE), g_job.rate_bytes_per_second / (double)MEBIBYTE);
 }

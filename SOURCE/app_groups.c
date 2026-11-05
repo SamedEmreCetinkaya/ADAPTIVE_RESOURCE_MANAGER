@@ -5,7 +5,6 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
-#include <glob.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -17,6 +16,8 @@
 #define CPU_WEIGHT_MAXIMUM 10000LL
 #define CPU_WEIGHT_MINIMUM 1LL
 #define MAX_APP_GROUPS 4096
+#define MAX_APP_GROUPS_PER_USER 512
+#define MAX_ENTRIES_EXAMINED_PER_USER (MAX_APP_GROUPS_PER_USER * 4)
 #define MAX_GROUP_PATH_LENGTH 600
 
 struct app_group {
@@ -177,7 +178,7 @@ static void selector_to_cpu_set(const struct cpu_selector *selector, cpu_set_t *
 static void affinity_for_tree(const char *directory_path, const cpu_set_t *set) {
     char path[PATH_BUFFER_SIZE];
     attribute_path(path, sizeof path, directory_path, "cgroup.threads");
-    FILE *file = fopen(path, "r");
+    FILE *file = open_for_reading(path);
     if (file) {
         int tid;
         while (fscanf(file, "%d", &tid) == 1) sched_setaffinity(tid, sizeof *set, set);
@@ -361,38 +362,78 @@ static void group_record_originals(struct app_group *group) {
     read_text_file(path, group->original_cpu_max, sizeof group->original_cpu_max);
 }
 
+// A user can create directories without limit, so the work and memory for each user are capped. Other
+// users also leave room for the user at an active seat, so they cannot crowd out that user's applications.
+static bool refresh_groups_of_user(unsigned uid, bool has_seat) {
+    char slice[PATH_BUFFER_SIZE];
+    int length = snprintf(slice, sizeof slice, "%s/user.slice/user-%u.slice/user@%u.service/app.slice", g_paths.cgroup_root, uid, uid);
+    if (length < 0 || (size_t)length >= sizeof slice) return false;
+    DIR *directory = opendir(slice);
+    if (!directory) return false;
+    int limit = has_seat ? MAX_APP_GROUPS : MAX_APP_GROUPS - MAX_APP_GROUPS_PER_USER;
+    int groups = 0, examined = 0;
+    bool changed = false;
+    struct dirent *entry;
+    while (groups < MAX_APP_GROUPS_PER_USER && examined < MAX_ENTRIES_EXAMINED_PER_USER && (entry = readdir(directory))) {
+        if (entry->d_type != DT_DIR || entry->d_name[0] == '.') continue;
+        examined++;
+        char path[PATH_BUFFER_SIZE];
+        uid_t owner;
+        if (!join_child_path(path, sizeof path, slice, entry->d_name) || !group_path_is_valid(path, &owner)) continue;
+        struct app_group *group = group_find(path);
+        if (!group) {
+            if (g_group_count >= limit) {
+                static bool limit_logged;
+                if (!limit_logged) log_event("event=GROUP_LIMIT_REACHED limit=%d", limit);
+                limit_logged = true;
+                break;
+            }
+            group = group_add(path);
+            group_record_originals(group);
+            apply_background(group);
+            changed = true;
+        } else if (group->original_cpu_weight == 0) {
+            group_record_originals(group);
+        }
+        group->seen = true;
+        groups++;
+    }
+    closedir(directory);
+    return changed;
+}
+
+// The user at an active seat comes first. Directory names under user.slice are read, never trusted.
+static bool refresh_groups_of_all_users(void) {
+    uid_t seats[MAX_SEATS];
+    int seat_count = active_seat_uids(seats, MAX_SEATS);
+    bool changed = false;
+    for (int i = 0; i < seat_count; i++) {
+        if (refresh_groups_of_user((unsigned)seats[i], true)) changed = true;
+    }
+    char path[PATH_BUFFER_SIZE];
+    if (!join_child_path(path, sizeof path, g_paths.cgroup_root, "user.slice")) return changed;
+    DIR *directory = opendir(path);
+    if (!directory) return changed;
+    struct dirent *entry;
+    while ((entry = readdir(directory))) {
+        unsigned uid;
+        int consumed = -1;
+        if (sscanf(entry->d_name, "user-%u.slice%n", &uid, &consumed) != 1 || consumed < 0 || entry->d_name[consumed]) continue;
+        bool has_seat = false;
+        for (int i = 0; i < seat_count; i++) {
+            if ((unsigned)seats[i] == uid) has_seat = true;
+        }
+        if (!has_seat && refresh_groups_of_user(uid, false)) changed = true;
+    }
+    closedir(directory);
+    return changed;
+}
+
 void app_groups_refresh(void) {
-    char pattern[PATH_BUFFER_SIZE + 64];
-    snprintf(pattern, sizeof pattern, "%s/user.slice/user-*.slice/user@*.service/app.slice/*", g_paths.cgroup_root);
-    glob_t matches;
     char foreground_path[PATH_BUFFER_SIZE] = "";
     if (g_foreground) snprintf(foreground_path, sizeof foreground_path, "%s", g_foreground->path);
     for (int i = 0; i < g_group_count; i++) g_groups[i].seen = false;
-    bool changed = false;
-    if (glob(pattern, GLOB_ONLYDIR | GLOB_NOSORT, NULL, &matches) == 0) {
-        for (size_t m = 0; m < matches.gl_pathc; m++) {
-            uid_t owner;
-            if (!group_path_is_valid(matches.gl_pathv[m], &owner)) continue;
-            struct app_group *group = group_find(matches.gl_pathv[m]);
-            if (!group) {
-                // A user can create directories without limit. Memory here must stay bounded.
-                static bool limit_logged;
-                if (g_group_count >= MAX_APP_GROUPS) {
-                    if (!limit_logged) log_event("event=GROUP_LIMIT_REACHED limit=%d", MAX_APP_GROUPS);
-                    limit_logged = true;
-                    continue;
-                }
-                group = group_add(matches.gl_pathv[m]);
-                group_record_originals(group);
-                apply_background(group);
-                changed = true;
-            } else if (group->original_cpu_weight == 0) {
-                group_record_originals(group);
-            }
-            group->seen = true;
-        }
-        globfree(&matches);
-    }
+    bool changed = refresh_groups_of_all_users();
     // Remove groups that no longer exist.
     int kept = 0;
     for (int i = 0; i < g_group_count; i++) {

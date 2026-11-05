@@ -55,6 +55,7 @@ check_contains "shipped policy observes" 'RUN_MODE=OBSERVE' "$WORK/policy"
 echo 'FOREGROUND_CPU_SET=LEAST_BUSY:12.50' > "$WORK/decimal.conf"
 "$BINARY" --print-policy --config "$WORK/decimal.conf" > "$WORK/decimal" 2>&1
 check_contains "accepts two decimals in selectors" 'LEAST_BUSY:12.50' "$WORK/decimal"
+check "growth margin matches the largest swap file" "$(sed -n 's/^SWAP_FILE_GROWTH_MARGIN_PERCENT_OF_MEMORY=//p' "$ROOT/CONFIG/RESOURCE_POLICY.conf")" "$(sed -n 's/^SWAP_FILE_MAX_PERCENT=//p' "$ROOT/CONFIG/SYSTEM_TUNABLES.conf")"
 
 echo "== Policy works together on 8, 16, 24 and 32 GB"
 # Usable memory is about 1 GiB below the nominal size. Amounts in MiB, measured on the development machine:
@@ -246,6 +247,7 @@ stop_enforce_daemon() { # log
 echo "ACTIVE_UID=$(( $(id -u) + 1 ))" > "$WORK/seats/seat0"
 start_enforce_daemon "$WORK/seat.log"
 check "saved limits are private" "$(stat -c %a "$WORK/run/ORIGINAL_VALUES")" 600
+check "the focus socket is closed to other users" "$(stat -c %a "$WORK/run/focus.sock")" 600
 send_focus $$
 wait_for 'FOCUS_REPORT_REJECTED' "$WORK/seat.log"
 check_contains "rejects a sender without the active seat" 'reason=NOT_ACTIVE_SEAT_USER' "$WORK/seat.log"
@@ -278,6 +280,41 @@ start_enforce_daemon "$WORK/forged.log"
 stop_enforce_daemon "$WORK/forged.log"
 check "saved limits cannot name a path outside application groups" "$(read_value "$WORK/outside.scope/memory.high")" max
 
+LINK_GROUP="$FAKE$APP_SLICE/app-link-test.scope"
+mkdir -p "$LINK_GROUP"
+make_group "$LINK_GROUP" max max max 100 "max 100000"
+echo keep > "$WORK/link_target"
+rm "$LINK_GROUP/memory.high"
+ln -s "$WORK/link_target" "$LINK_GROUP/memory.high"
+start_enforce_daemon "$WORK/link.log"
+stop_enforce_daemon "$WORK/link.log"
+check "a limit is never written through a link" "$(read_value "$WORK/link_target")" keep
+rm -rf "$LINK_GROUP"
+
+echo "== Other users cannot crowd out the active user"
+create_foreign_groups() { # uid
+    FOREIGN="$FAKE/user.slice/user-$1.slice/user@$1.service/app.slice"
+    mkdir -p "$FOREIGN"
+    ( cd "$FOREIGN" && mkdir $(seq -f 'flood%g.scope' 1 600) )
+}
+create_foreign_groups 200000
+start_enforce_daemon "$WORK/flood.log"
+wait_for 'GROUPS=514 ' "$WORK/run/STATUS"
+check_contains "one user is limited to 512 groups" 'GROUPS=514 ' "$WORK/run/STATUS"
+stop_enforce_daemon "$WORK/flood.log"
+for FOREIGN_UID in 200001 200002 200003 200004 200005 200006 200007 200008; do create_foreign_groups "$FOREIGN_UID"; done
+start_enforce_daemon "$WORK/flood.log"
+wait_for 'GROUPS=3584 ' "$WORK/run/STATUS"
+check_contains "other users stop below the total limit" 'GROUPS=3584 ' "$WORK/run/STATUS"
+check_contains "the limit is logged" 'event=GROUP_LIMIT_REACHED' "$WORK/flood.log"
+NEW_GROUP="$FAKE$APP_SLICE/app-after-flood.scope"
+mkdir -p "$NEW_GROUP"
+make_group "$NEW_GROUP" max max max 100 "max 100000"
+wait_for "$HIGH_50" "$NEW_GROUP/memory.high"
+check "the active user's new group is still accepted" "$(read_value "$NEW_GROUP/memory.high")" "$HIGH_50"
+stop_enforce_daemon "$WORK/flood.log"
+rm -rf "$NEW_GROUP" "$FAKE"/user.slice/user-20000?.slice
+
 chmod 775 "$WORK/run"
 "$BINARY" --config "$WORK/enforce.conf" --runtime-dir "$WORK/run" --cgroup-root "$FAKE" --proc-swaps "$WORK/swaps" --seat-directory "$WORK/seats" > /dev/null 2>&1
 check "refuses a runtime directory others can change" "$?" 1
@@ -300,7 +337,9 @@ IDLE_READBACK_CALM_SECONDS=3600
 IDLE_READBACK_RESERVE_PERCENT=0
 IDLE_PRESSURE_STOP_PERCENT=100
 SWAP_FILE_DIRECTORY=$WORK/swap_files
+SWAP_FILE_MIN_FREE_DISK_PERCENT=0
 EOF
+RETIRE_CONFIG="$WORK/retire.conf"
 # The kernel refuses swapoff here, so a SWAPOFF_FAILED line means the daemon chose to retire the file.
 run_retire() { # zram_used_kib file_used_kib
     {
@@ -308,7 +347,7 @@ run_retire() { # zram_used_kib file_used_kib
         echo "/dev/zram0 partition $MEMORY_KIB $1 100"
         echo "$WORK/swap_files/1 file $MEMORY_KIB $2 -1"
     } > "$WORK/retire_swaps"
-    "$BINARY" --config "$WORK/retire.conf" --runtime-dir "$WORK/run" --cgroup-root "$FAKE" --proc-swaps "$WORK/retire_swaps" --seat-directory "$WORK/seats" > "$WORK/retire.log" 2>&1 &
+    "$BINARY" --config "$RETIRE_CONFIG" --runtime-dir "$WORK/run" --cgroup-root "$FAKE" --proc-swaps "$WORK/retire_swaps" --seat-directory "$WORK/seats" > "$WORK/retire.log" 2>&1 &
     DAEMON_PID=$!
     wait_for 'event=STARTED' "$WORK/retire.log"
     sleep 2.5
@@ -340,6 +379,47 @@ chmod 777 "$WORK/swap_files"
 run_retire 0 0
 check "a directory others can change is not trusted" "$ATTEMPTS" 0
 chmod 700 "$WORK/swap_files"
+
+echo "== Disk guard"
+SIGNAL_FILE="$WORK/signal_seen"
+MANAGER_GROUP="$FAKE/system.slice/swapspace.service"
+mkdir -p "$MANAGER_GROUP"
+sh -c 'trap "echo seen >> \"$1\"" USR2; while :; do sleep 0.1; done' sh "$SIGNAL_FILE" &
+SIGNAL_TARGET=$!
+sleep 0.3
+echo "$SIGNAL_TARGET" > "$MANAGER_GROUP/cgroup.procs"
+chmod 644 "$MANAGER_GROUP/cgroup.procs"
+: > "$SIGNAL_FILE"
+# A limit of 100% is always crossed. No memory rule would allow retiring anything here.
+cat > "$WORK/guard.conf" <<EOF
+RUN_MODE=ENFORCE
+FOREGROUND_READBACK_ENABLED=0
+IDLE_READBACK_CALM_SECONDS=3600
+IDLE_READBACK_RESERVE_PERCENT=100
+IDLE_PRESSURE_STOP_PERCENT=1
+SWAP_FILE_DIRECTORY=$WORK/swap_files
+SWAP_FILE_MIN_FREE_DISK_PERCENT=100
+EOF
+RETIRE_CONFIG="$WORK/guard.conf"
+run_retire "$MEMORY_KIB" 0
+check "an empty file goes back under the disk limit, whatever memory does" "$ATTEMPTS" 1
+check_contains "the hold is logged" 'event=SWAP_GROWTH_HELD' "$WORK/retire.log"
+check_contains "status reports the hold" 'SWAP_GROWTH=HELD' "$WORK/run/STATUS"
+check "swapspace is told to add no file" "$([ -s "$SIGNAL_FILE" ] && echo yes)" yes
+check "the signal repeats while the limit holds" "$([ "$(wc -l < "$SIGNAL_FILE")" -ge 2 ] && echo yes)" yes
+run_retire "$MEMORY_KIB" $(( MEMORY_KIB / 200 ))
+check "a file with pages keeps the normal rules under the disk limit" "$ATTEMPTS" 0
+: > "$SIGNAL_FILE"
+chmod 664 "$MANAGER_GROUP/cgroup.procs"
+run_retire "$MEMORY_KIB" 0
+check "a process list others can change gets no signal" "$(wc -c < "$SIGNAL_FILE")" 0
+chmod 644 "$MANAGER_GROUP/cgroup.procs"
+RETIRE_CONFIG="$WORK/retire.conf"
+: > "$SIGNAL_FILE"
+run_retire "$MEMORY_KIB" 0
+check "a limit of 0 turns the guard off" "$(wc -c < "$SIGNAL_FILE")" 0
+check_contains "status reports growth allowed" 'SWAP_GROWTH=ALLOWED' "$WORK/run/STATUS"
+kill "$SIGNAL_TARGET" 2>/dev/null; wait "$SIGNAL_TARGET" 2>/dev/null
 
 echo "== CPU selectors follow the detected topology"
 # Each selector is checked against what the probe found on this machine.

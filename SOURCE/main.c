@@ -2,7 +2,6 @@
 // its swapped pages back. All amounts are relative to the machine it runs on.
 #include "resource_manager.h"
 
-#include <dirent.h>
 #include <errno.h>
 #include <getopt.h>
 #include <poll.h>
@@ -21,6 +20,7 @@
 #define DEFAULT_SEAT_DIRECTORY "/run/systemd/seats"
 #define MAX_FOCUS_REPORTS_PER_POLL 32
 #define REJECTED_REPORT_LOG_INTERVAL_SECONDS 1.0
+#define FOCUS_SOCKET_OWNER_CHECK_SECONDS 1.0
 #define FOCUS_SOCKET_NAME "focus.sock"
 #define STATUS_FILE_NAME "STATUS"
 #define GROUP_REFRESH_INTERVAL_SECONDS 5.0
@@ -65,9 +65,8 @@ static int open_focus_socket(void) {
         close(descriptor);
         return -1;
     }
-    // Any local user can send, because the desktop user is not known in advance. Each report is checked
-    // against the sender's credentials and its seat before it has any effect.
-    if (chmod(address.sun_path, 0666) != 0) {
+    // Only the owner can send, and update_focus_socket_owner makes the active seat user the owner.
+    if (chmod(address.sun_path, 0600) != 0) {
         perror("chmod");
         close(descriptor);
         return -1;
@@ -81,29 +80,19 @@ static int open_focus_socket(void) {
     return descriptor;
 }
 
-// Only the user sitting at an active seat can claim the foreground. Another local user or a remote
-// login gets no priority from this socket. Without logind's seat data nobody can claim it.
-static bool sender_has_active_seat(uid_t sender) {
-    DIR *directory = opendir(g_paths.seat_directory);
-    if (!directory) return false;
-    bool active = false;
-    struct dirent *entry;
-    while (!active && (entry = readdir(directory))) {
-        char path[PATH_BUFFER_SIZE], line[128];
-        if (entry->d_name[0] == '.' || !join_child_path(path, sizeof path, g_paths.seat_directory, entry->d_name)) continue;
-        FILE *file = fopen(path, "r");
-        if (!file) continue;
-        while (fgets(line, sizeof line, file)) {
-            if (strncmp(line, "ACTIVE_UID=", 11)) continue;
-            char *end;
-            unsigned long uid = strtoul(line + 11, &end, 10);
-            active = end != line + 11 && uid == sender;
-            break;
-        }
-        fclose(file);
-    }
-    closedir(directory);
-    return active;
+// A socket every local user could reach would let any of them fill its queue and block the reports of
+// the active user. Without logind's seat data the owner stays root, so nobody can send.
+static void update_focus_socket_owner(double now) {
+    static double next_check_at;
+    static uid_t current_owner = (uid_t)-1;
+    if (now < next_check_at) return;
+    next_check_at = now + FOCUS_SOCKET_OWNER_CHECK_SECONDS;
+    uid_t seats[MAX_SEATS];
+    if (!active_seat_uids(seats, MAX_SEATS) || seats[0] == current_owner) return;
+    char path[PATH_BUFFER_SIZE + 32];
+    snprintf(path, sizeof path, "%s/%s", g_paths.runtime_directory, FOCUS_SOCKET_NAME);
+    if (chown(path, seats[0], (gid_t)-1) != 0) log_event("event=FOCUS_SOCKET_OWNER_FAILED uid=%u error=\"%s\"", (unsigned)seats[0], strerror(errno));
+    current_owner = seats[0];
 }
 
 // A flood of bad reports must not fill the journal.
@@ -140,7 +129,9 @@ static bool read_focus_report(int descriptor, pid_t *reported, uid_t *reporter) 
     char *end;
     long pid = strtol(text, &end, 10);
     if (end == text || pid <= 0 || pid > 4194304 || sender == (uid_t)-1) return false;
-    if (!sender_has_active_seat(sender)) {
+    // Checked by user ID, so a remote login of the active seat user counts as that user. Another local
+    // user gets nothing here, and without logind's seat data nobody does.
+    if (!uid_has_active_seat(sender)) {
         log_rejected_report(pid, sender, "NOT_ACTIVE_SEAT_USER");
         return false;
     }
@@ -277,6 +268,7 @@ static int run_daemon(void) {
     struct pollfd poll_entry = {.fd = focus_socket, .events = POLLIN};
     while (!g_stop) {
         double now = monotonic_seconds();
+        update_focus_socket_owner(now);
         double wait = readback_next_due_seconds(now);
         if (pending) {
             double remaining = pending_since + g_policy.focus_debounce_milliseconds / 1000.0 - now;
@@ -309,6 +301,7 @@ static int run_daemon(void) {
         }
         app_groups_process_timers(now);
         report_stall_if_due(now);
+        readback_disk_guard_tick(monotonic_seconds());
         readback_tick(monotonic_seconds());
         if (now >= next_status) {
             write_status();

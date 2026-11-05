@@ -54,6 +54,7 @@ gnome-extensions enable focus-reporter@adaptive-resource-manager   # after loggi
 sudo sh SCRIPTS/ENABLE_ENFORCE.sh # relative settings and ENFORCE mode, backups first
 sudo reboot                       # the zram size changes at boot
 sh TESTS/RUN_PRESSURE_TEST.sh     # 140% of memory on the new settings. Close your work first.
+sudo sh TESTS/RUN_DISK_GUARD_TEST.sh # disk limit with the real swapspace, without filling the disk
 ```
 
 Check the state with `cat /run/adaptive-resource-manager/STATUS`. The log is in
@@ -103,6 +104,12 @@ Its pages are then read back in small steps. If memory is needed, the read stops
 released without being written. The file is retired when almost nothing would have to be read at once,
 because `swapoff` cannot be interrupted inside a single large process.
 
+When the disk that holds the swap files gets close to `SWAP_FILE_MIN_FREE_DISK_PERCENT` free space, no new
+swap file is opened, even if memory runs out and the kernel has to kill a process. Growth stops one
+largest file early, so a new file cannot cross the limit. Under the limit, empty swap files go back at once.
+Files that hold pages stay in use. They take no more disk as they fill, and removing them under pressure
+would read their pages back into memory that is already short.
+
 The zram size is only a ceiling and takes no memory until pages arrive, so monitors count it in the swap
 total even when nothing uses it. Only swap files take real disk space.
 
@@ -125,6 +132,8 @@ constraints at each size, using about 1 GiB less than the nominal size as usable
 | `READBACK_MAX_CHUNK_PERCENT_OF_MEMORY=0.05` | At most 16 MiB, measured at about 5 ms per call |
 | `SWAP_FILE_RETIRE_UNREACHABLE_PERCENT=1.00` | The expected `swapoff` read stays under about 3 s |
 | `SWAP_FILE_RETIRE_WORST_CASE_READ_PERCENT=5.00` | The kernel counts the swap cache for all devices together, so that estimate can be wrong. This bounds the read at about 7 s on 16 GB and 14 s on 32 GB, measured at 8.85 s/GiB |
+| `SWAP_FILE_MIN_FREE_DISK_PERCENT=5.00` | Keeps room for other programs: 16 GiB on a 327 GiB disk, 3.2 GiB on a 64 GiB disk. `0` turns it off |
+| `SWAP_FILE_GROWTH_MARGIN_PERCENT_OF_MEMORY=13.00` | Equal to `SWAP_FILE_MAX_PERCENT`, so one more file cannot cross the disk limit |
 | `SWAP_FILE_RETIRE_MIN_FREE_SWAP_PERCENT=30.00` | At least 2 GiB remains, about 2 s of zram filling at a measured 1 GiB/s, and swapspace does not need a new file right away |
 
 The workload figures were measured on one 16 GB machine. Other sizes are calculated, not measured.
@@ -145,19 +154,20 @@ Everything is discovered at runtime. Run `adaptive-resource-managerd --probe` to
 ## Security
 
 The daemon needs root powers, so everything it accepts from outside is checked. It holds only
-`CAP_SYS_ADMIN`, `CAP_SYS_NICE`, `CAP_SYS_PTRACE` and `CAP_DAC_OVERRIDE`, and has no network. Its unit also
+`CAP_SYS_ADMIN`, `CAP_SYS_NICE`, `CAP_SYS_PTRACE`, `CAP_DAC_OVERRIDE` and `CAP_CHOWN`, and has no network. Its unit also
 limits system calls and makes everything except cgroups and the swap directory read-only. It reads where
 other processes' pages are swapped, never the contents of their memory.
 
 | Input | Check |
 | --- | --- |
-| Focus socket, which any local user can reach | The kernel supplies the sender's identity. The sender must be the user at an active seat, the process must belong to the sender, and the group must belong to the sender. Other reports have no effect, and logging them is rate limited. |
+| Focus socket | Mode 600 and owned by the user at the active seat, so other users cannot fill its queue. The kernel supplies the sender's identity. The sender must be that user, and the process and group must belong to the sender. Other reports have no effect, and logging them is rate limited. |
 | Group names, which users choose | Only `user.slice/user-UID.slice/user@UID.service/app.slice/UNIT` with a valid unit name is accepted. This keeps line breaks and forged fields out of logs and saved limits. |
 | `RESOURCE_POLICY.conf` | As root, it must be a regular file, not a link, that only root can change. Unknown keys and invalid values stop the daemon. |
 | `SYSTEM_TUNABLES.conf` | Same ownership rule. It is read as values and never executed. |
 | Runtime directory | It must not be a link, and only the daemon's user may change it. Saved limits there are mode 600, and restored paths must be real application groups. |
 | Swap files | Before `swapoff` and `unlink`, each file must be a regular file, not a link, directly inside a directory, and both must be changeable only by the daemon's user. |
-| Memory use | Group count and scan results are capped, and the unit has `MemoryMax=1%`, so a user cannot grow the daemon without limit. |
+| Memory use | Scan results and groups are capped, at 512 per user and 4096 in total, with room always kept for the user at the active seat. The unit has `MemoryMax=1%`. |
+| Cgroup files | Reads and writes do not follow links, in addition to cgroup v2 not allowing them. |
 | Status file | Every local user can read it, so it names no application. |
 | Scripts | `INSTALL.sh` and `UNINSTALL.sh` work in the user's home as that user, not as root. `DISABLE_ENFORCE.sh` restores only from a root-owned backup directory, and only under `/etc` and `/usr/local`. |
 
@@ -168,8 +178,9 @@ What this does not protect against:
 
 - Any program of the user at the active seat can report a false focus and give one of that user's
   applications priority. The compositor offers no proof of which window really has focus.
+- A remote login of the user at the active seat counts as that user.
 - `sudo sh SCRIPTS/...` runs files from a directory you own. Anything running as your user could change
-  them first, so install from a clean state.
+  them first, so check `git status` and install from a clean state.
 - Swap files are not encrypted by this software. Memory contents can reach the disk unless the disk itself
   is encrypted.
 
@@ -181,7 +192,13 @@ To report a security problem, contact the maintainer through GitHub before publi
   overwrite its limits until the next focus change.
 - Pages in tmpfs or GPU memory cannot be read back; only `swapoff` reaches them.
 - `memory.low` is best effort, not a guarantee.
+- On kernels with `vm.anon_min_ratio`, anonymous memory below that share is not reclaimed, so released
+  pages can stay in memory until the total rises. `RUN_ROOT_TESTS.sh` may turn it off while it runs.
 - Without zram, the last swap file stays because no other swap would remain.
+- The disk limit only stops swap files. Other programs can still fill the disk.
+- Any local user who fills the disk also stops swap growth, and processes can then be killed earlier.
+- On a machine with several seats, only the user of the first active seat can report focus.
+- The disk limit works through swapspace's `SIGUSR2`. Another swap manager is not held back.
 - The kernel allows about 23 swap files besides zram. After that swapspace cannot add space, and the
   kernel kills processes if demand keeps growing.
 - The daemon does not answer focus changes during a `swapoff`. This is usually under a second, and

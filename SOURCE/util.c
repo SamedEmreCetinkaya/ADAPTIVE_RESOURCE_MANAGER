@@ -2,6 +2,7 @@
 #include "resource_manager.h"
 
 #include <ctype.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -47,8 +48,56 @@ bool path_is_trusted(const char *path, bool directory) {
     return info.st_uid == geteuid() && !(info.st_mode & (S_IWGRP | S_IWOTH));
 }
 
+// logind keeps one file per seat. seat0 comes first, because it is the seat of an ordinary desktop.
+int active_seat_uids(uid_t *uids, int capacity) {
+    DIR *directory = opendir(g_paths.seat_directory);
+    if (!directory) return 0;
+    int count = 0;
+    struct dirent *entry;
+    while (count < capacity && (entry = readdir(directory))) {
+        char path[PATH_BUFFER_SIZE], line[128];
+        if (entry->d_name[0] == '.' || !join_child_path(path, sizeof path, g_paths.seat_directory, entry->d_name)) continue;
+        FILE *file = open_for_reading(path);
+        if (!file) continue;
+        while (fgets(line, sizeof line, file)) {
+            if (strncmp(line, "ACTIVE_UID=", 11)) continue;
+            char *end;
+            unsigned long uid = strtoul(line + 11, &end, 10);
+            if (end == line + 11) break;
+            if (!strcmp(entry->d_name, "seat0") && count) {
+                uids[count++] = uids[0];
+                uids[0] = (uid_t)uid;
+            } else {
+                uids[count++] = (uid_t)uid;
+            }
+            break;
+        }
+        fclose(file);
+    }
+    closedir(directory);
+    return count;
+}
+
+bool uid_has_active_seat(uid_t uid) {
+    uid_t uids[MAX_SEATS];
+    int count = active_seat_uids(uids, MAX_SEATS);
+    for (int i = 0; i < count; i++) {
+        if (uids[i] == uid) return true;
+    }
+    return false;
+}
+
+// Cgroup names come from users, so nothing read from their tree may follow a link.
+FILE *open_for_reading(const char *path) {
+    int descriptor = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (descriptor < 0) return NULL;
+    FILE *file = fdopen(descriptor, "r");
+    if (!file) close(descriptor);
+    return file;
+}
+
 bool read_text_file(const char *path, char *buffer, size_t buffer_size) {
-    int descriptor = open(path, O_RDONLY | O_CLOEXEC);
+    int descriptor = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
     if (descriptor < 0) return false;
     ssize_t length = read(descriptor, buffer, buffer_size - 1);
     close(descriptor);
@@ -66,7 +115,7 @@ long long read_limit_file(const char *path, long long fallback) {
 }
 
 long long read_keyed_value(const char *path, const char *key, long long fallback) {
-    FILE *file = fopen(path, "r");
+    FILE *file = open_for_reading(path);
     if (!file) return fallback;
     char line[256];
     size_t key_length = strlen(key);
@@ -114,7 +163,7 @@ uint64_t percent_of(uint64_t total, double percent) {
 
 struct pressure_sample read_pressure(const char *path) {
     struct pressure_sample sample = {100.0, 0};
-    FILE *file = fopen(path, "r");
+    FILE *file = open_for_reading(path);
     if (!file) return sample;
     if (fscanf(file, "some avg10=%lf avg60=%*f avg300=%*f total=%llu", &sample.some_average_10s,
                &sample.some_total_microseconds) != 2) {
