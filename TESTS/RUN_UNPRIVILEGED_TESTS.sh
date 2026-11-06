@@ -6,9 +6,11 @@ BINARY="$ROOT/BUILD/adaptive-resource-managerd-sanitized"
 WORK=$(mktemp -d)
 FAILURES=0
 DAEMON_PID=""
+OUTSIDE_PID=""
 
 cleanup() {
     [ -n "$DAEMON_PID" ] && kill -9 "$DAEMON_PID" 2>/dev/null
+    [ -n "$OUTSIDE_PID" ] && kill "$OUTSIDE_PID" 2>/dev/null
     rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -57,6 +59,131 @@ echo 'FOREGROUND_CPU_SET=LEAST_BUSY:12.50' > "$WORK/decimal.conf"
 check_contains "accepts two decimals in selectors" 'LEAST_BUSY:12.50' "$WORK/decimal"
 check "growth margin matches the largest swap file" "$(sed -n 's/^SWAP_FILE_GROWTH_MARGIN_PERCENT_OF_MEMORY=//p' "$ROOT/CONFIG/RESOURCE_POLICY.conf")" "$(sed -n 's/^SWAP_FILE_MAX_PERCENT=//p' "$ROOT/CONFIG/SYSTEM_TUNABLES.conf")"
 
+echo "== System check"
+CHECK="$ROOT/SCRIPTS/CHECK_SYSTEM.sh"
+SYSTEM="$WORK/system"
+STUBS="$WORK/stubs"
+mkdir -p "$STUBS" "$SYSTEM/run/systemd/system" "$SYSTEM/run/systemd/seats" "$SYSTEM/sys/fs/cgroup" "$SYSTEM/sys/fs/selinux" \
+    "$SYSTEM/sys/module/zswap/parameters" "$SYSTEM/proc/pressure" "$SYSTEM/proc/self" "$SYSTEM/var/lib" "$SYSTEM/usr/lib/systemd/system-generators" "$SYSTEM/usr/lib/systemd/system"
+echo 'cpuset cpu io memory pids' > "$SYSTEM/sys/fs/cgroup/cgroup.controllers"
+echo 'cgroup2 /sys/fs/cgroup cgroup2 rw,nsdelegate,memory_recursiveprot 0 0' > "$SYSTEM/proc/mounts"
+echo 'some avg10=0.00 avg60=0.00 avg300=0.00 total=0' > "$SYSTEM/proc/pressure/memory"
+echo N > "$SYSTEM/sys/module/zswap/parameters/enabled"
+echo 0 > "$SYSTEM/sys/fs/selinux/enforce"
+echo "0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-test.scope" > "$SYSTEM/proc/self/cgroup"
+printf '#!/bin/sh\n' > "$SYSTEM/usr/lib/systemd/system-generators/zram-generator"
+chmod 755 "$SYSTEM/usr/lib/systemd/system-generators/zram-generator"
+mkdir -p "$SYSTEM/usr/sbin"
+cp "$SYSTEM/usr/lib/systemd/system-generators/zram-generator" "$SYSTEM/usr/sbin/swapspace"
+: > "$SYSTEM/usr/lib/systemd/system/swapspace.service"
+stub() { printf '#!/bin/sh\n%s\n' "$2" > "$STUBS/$1"; chmod 755 "$STUBS/$1"; }
+stub uname 'case "$1" in -m) echo "${STUB_MACHINE:-x86_64}" ;; -r) echo "${STUB_RELEASE:-6.12.0-amd64}" ;; esac'
+stub systemctl '[ "$3" = "${STUB_ACTIVE:-}" ]'
+stub gnome-shell 'echo "GNOME Shell ${STUB_SHELL:-48.7}"'
+stub stat 'echo "${STUB_FILESYSTEM:-ext2/ext3}"'
+# run_check MODE [NAME=VALUE...]: the result is in CHECK_STATUS and $WORK/check.out
+run_check() {
+    CHECK_MODE=$1
+    shift
+    env PATH="$STUBS:$PATH" "$@" sh "$CHECK" "$CHECK_MODE" "$SYSTEM" > "$WORK/check.out" 2>&1
+    CHECK_STATUS=$?
+}
+check_passes() { # name
+    check "$1" "$CHECK_STATUS $(grep -c '^WARN' "$WORK/check.out") $(grep -c '^BLOCK' "$WORK/check.out")" "0 0 0"
+}
+check_warns() { # name pattern
+    check "$1 still passes" "$CHECK_STATUS" 0
+    check_contains "$1 warns" "^WARN.*$2" "$WORK/check.out"
+}
+check_blocks() { # name pattern
+    check "$1 stops the install" "$CHECK_STATUS" 1
+    check_contains "$1 is named" "^BLOCK.*$2" "$WORK/check.out"
+}
+run_check enforce
+check_passes "a supported system has no warnings"
+check_contains "the result is reported" 'CHECK_SYSTEM=PASSED warnings=0' "$WORK/check.out"
+run_check enforce STUB_RELEASE=7.2.15-x64v3-xanmod1
+check_passes "a kernel with a long release name passes"
+run_check enforce STUB_RELEASE=6.7.0
+check_passes "the oldest supported kernel passes"
+run_check enforce STUB_RELEASE=6.10.3
+check_passes "kernel 6.10 is newer than 6.7, not older"
+run_check enforce STUB_RELEASE=6.6.30
+check_blocks "kernel 6.6" 'Linux 6.6'
+run_check enforce STUB_RELEASE=5.15.0
+check_blocks "kernel 5.15" 'Linux 5.15'
+run_check enforce STUB_RELEASE=unknown
+check_blocks "an unreadable kernel version" 'could not read'
+run_check enforce STUB_MACHINE=aarch64
+check_blocks "another architecture" 'aarch64'
+run_check enforce STUB_ACTIVE=systemd-oomd
+check_warns "systemd-oomd" 'systemd-oomd'
+run_check enforce STUB_ACTIVE=earlyoom
+check_warns "earlyoom" 'earlyoom'
+run_check enforce STUB_SHELL=47.2
+check_warns "another GNOME version" 'No focus reporter.*47'
+# Stands in for a missing command, which also prints nothing on standard output.
+stub gnome-shell 'exit 127'
+run_check enforce
+check_warns "a desktop without GNOME Shell" 'No focus reporter.*not found'
+stub gnome-shell 'echo "GNOME Shell ${STUB_SHELL:-48.7}"'
+run_check enforce STUB_FILESYSTEM=btrfs
+check_warns "btrfs" 'btrfs'
+run_check enforce STUB_FILESYSTEM=xfs
+check_warns "xfs" 'xfs'
+run_check enforce STUB_FILESYSTEM=zfs
+check_blocks "ZFS" 'ZFS'
+run_check install STUB_FILESYSTEM=zfs
+check_passes "the filesystem does not matter before swap files are used"
+echo 1 > "$SYSTEM/sys/fs/selinux/enforce"
+run_check enforce
+check_warns "enforcing SELinux" 'SELinux'
+echo 0 > "$SYSTEM/sys/fs/selinux/enforce"
+echo Y > "$SYSTEM/sys/module/zswap/parameters/enabled"
+run_check enforce
+check_warns "zswap" 'zswap'
+echo N > "$SYSTEM/sys/module/zswap/parameters/enabled"
+mv "$SYSTEM/proc/pressure/memory" "$WORK/pressure.saved"
+run_check enforce
+check_warns "missing pressure information" 'psi=1'
+mv "$WORK/pressure.saved" "$SYSTEM/proc/pressure/memory"
+echo 'cgroup2 /sys/fs/cgroup cgroup2 rw,nsdelegate 0 0' > "$SYSTEM/proc/mounts"
+run_check enforce
+check_warns "missing recursive protection" 'memory_recursiveprot'
+echo 'cgroup2 /sys/fs/cgroup cgroup2 rw,nsdelegate,memory_recursiveprot 0 0' > "$SYSTEM/proc/mounts"
+echo '0::/user.slice/user-1000.slice/session-2.scope' > "$SYSTEM/proc/self/cgroup"
+run_check enforce
+check_warns "a shell outside app.slice" 'outside app.slice'
+echo "0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-test.scope" > "$SYSTEM/proc/self/cgroup"
+rmdir "$SYSTEM/run/systemd/seats"
+run_check enforce
+check_warns "no seat information" 'No logind seat'
+mkdir "$SYSTEM/run/systemd/seats"
+rmdir "$SYSTEM/run/systemd/system"
+run_check enforce
+check_blocks "no systemd" 'systemd is not running'
+mkdir "$SYSTEM/run/systemd/system"
+echo 'cpuset cpu io pids' > "$SYSTEM/sys/fs/cgroup/cgroup.controllers"
+run_check enforce
+check_blocks "no memory controller" 'memory controller'
+echo 'cpuset cpu io memory pids' > "$SYSTEM/sys/fs/cgroup/cgroup.controllers"
+rm "$SYSTEM/usr/sbin/swapspace"
+run_check enforce
+check_blocks "missing swapspace" 'swapspace is missing'
+run_check install
+check_passes "swapspace is not needed before enforcing"
+cp "$SYSTEM/usr/lib/systemd/system-generators/zram-generator" "$SYSTEM/usr/sbin/swapspace"
+rm "$SYSTEM/usr/lib/systemd/system/swapspace.service"
+run_check enforce
+check_blocks "swapspace without a service unit" 'swapspace.service is missing'
+: > "$SYSTEM/usr/lib/systemd/system/swapspace.service"
+chmod 644 "$SYSTEM/usr/lib/systemd/system-generators/zram-generator"
+run_check enforce
+check_blocks "missing zram-generator" 'zram-generator is missing'
+chmod 755 "$SYSTEM/usr/lib/systemd/system-generators/zram-generator"
+run_check nonsense
+check "an unknown mode is refused" "$CHECK_STATUS" 2
+
 echo "== Policy works together on 8, 16, 24 and 32 GB"
 # Usable memory is about 1 GiB below the nominal size. Amounts in MiB, measured on the development machine:
 # hot desktop and kernel 1434, protected clean cache 15% (vm.clean_min_ratio on kernels that have it), foreground hot set 2150,
@@ -99,18 +226,20 @@ printf 'FOREGROUND_MEMORY_HIGH_PERCENT=10\nFOREGROUND_MEMORY_LOW_PERCENT=20\n' >
 "$BINARY" --print-policy --config "$WORK/bad.conf" > /dev/null 2>&1
 check "rejects low above high" "$?" 2
 
-# Fake cgroup tree: the real group name of this shell, plus one other application.
-REAL_GROUP=$(sed -n 's/^0:://p' /proc/$$/cgroup)
-case "$REAL_GROUP" in
-    */app.slice/*) ;;
-    *) REAL_GROUP="/user.slice/user-$(id -u).slice/user@$(id -u).service/app.slice/app-test-focus.scope" ;;
-esac
-GROUP_RELATIVE=$(echo "$REAL_GROUP" | sed -E 's|(/app\.slice/[^/]+).*|\1|')
-APP_SLICE=$(echo "$GROUP_RELATIVE" | sed 's|/app\.slice/.*|/app.slice|')
+# Fake cgroup tree with two applications. This shell counts as a member of one of them, wherever it really
+# runs, so the tests also work over SSH, on desktops without app.slice and in containers.
+APP_SLICE="/user.slice/user-$(id -u).slice/user@$(id -u).service/app.slice"
+GROUP_RELATIVE="$APP_SLICE/app-test-focus.scope"
 FAKE="$WORK/cgroup"
 FOCUS="$FAKE$GROUP_RELATIVE"
 OTHER="$FAKE$APP_SLICE/app-other-background.scope"
-mkdir -p "$FOCUS" "$OTHER" "$WORK/run" "$WORK/seats"
+mkdir -p "$FOCUS" "$OTHER" "$WORK/run" "$WORK/seats" "$WORK/proc/$$"
+echo "0::$GROUP_RELATIVE" > "$WORK/proc/$$/cgroup"
+# A process of this user outside app.slice, as the user manager is on a real system.
+sleep 3000 &
+OUTSIDE_PID=$!
+mkdir -p "$WORK/proc/$OUTSIDE_PID"
+echo "0::/user.slice/user-$(id -u).slice/user@$(id -u).service/init.scope" > "$WORK/proc/$OUTSIDE_PID/cgroup"
 chmod 700 "$WORK/run"
 echo "ACTIVE_UID=$(id -u)" > "$WORK/seats/seat0"
 make_group() {
@@ -135,7 +264,7 @@ RUN_MODE=OBSERVE
 FOCUS_DEBOUNCE_MILLISECONDS=50
 BACKGROUND_GRACE_SECONDS=1
 EOF
-"$BINARY" --config "$WORK/observe.conf" --runtime-dir "$WORK/run" --cgroup-root "$FAKE" --proc-swaps "$WORK/swaps" --seat-directory "$WORK/seats" > "$WORK/observe.log" 2>&1 &
+"$BINARY" --config "$WORK/observe.conf" --runtime-dir "$WORK/run" --cgroup-root "$FAKE" --proc-swaps "$WORK/swaps" --seat-directory "$WORK/seats" --proc-cgroups "$WORK/proc" > "$WORK/observe.log" 2>&1 &
 DAEMON_PID=$!
 wait_for 'event=STARTED' "$WORK/observe.log"
 sleep 0.3
@@ -169,12 +298,20 @@ BACKGROUND_MEMORY_HIGH_PERCENT=50.00
 FOREGROUND_CPU_WEIGHT_PERCENT=500.00
 BACKGROUND_CPU_QUOTA_PERCENT=50.00
 EOF
-"$BINARY" --config "$WORK/enforce.conf" --runtime-dir "$WORK/run" --cgroup-root "$FAKE" --proc-swaps "$WORK/swaps" --seat-directory "$WORK/seats" > "$WORK/enforce.log" 2>&1 &
+"$BINARY" --config "$WORK/enforce.conf" --runtime-dir "$WORK/run" --cgroup-root "$FAKE" --proc-swaps "$WORK/swaps" --seat-directory "$WORK/seats" --proc-cgroups "$WORK/proc" > "$WORK/enforce.log" 2>&1 &
 DAEMON_PID=$!
 wait_for 'event=STARTED' "$WORK/enforce.log"
 sleep 0.5
 HIGH_50=$(percent 50); HIGH_75=$(percent 75); LOW_25=$(percent 25)
-CPUS=$(nproc)
+# The CPUs the daemon sees. From coreutils 9.8 nproc also applies a CPU quota, as in a limited container.
+CPUS=$(python3 -I -c 'import os; print(len(os.sched_getaffinity(0)))')
+check "without a focus report a group keeps its memory.high" "$(read_value "$FOCUS/memory.high")" max
+check "without a focus report a group keeps its CPU quota" "$(read_value "$FOCUS/cpu.max")" "max 100000"
+check_contains "status shows no focus reporter" 'FOCUS_REPORTER=NONE' "$WORK/run/STATUS"
+send_focus "$OUTSIDE_PID"
+wait_for 'event=FOCUS_REPORTER_SEEN' "$WORK/enforce.log"
+wait_for 'FOCUS_REPORTER=SEEN' "$WORK/run/STATUS"
+check_contains "status shows the focus reporter" 'FOCUS_REPORTER=SEEN' "$WORK/run/STATUS"
 check "background gets relative memory.high" "$(read_value "$FOCUS/memory.high")" "$HIGH_50"
 check "background keeps a stricter original" "$(read_value "$OTHER/memory.high")" 4294967296
 check "background CPU quota scales with CPUs" "$(read_value "$FOCUS/cpu.max")" "$(( 100000 * CPUS / 2 )) 100000"
@@ -188,11 +325,13 @@ check "protection reaches ancestors" "$(read_value "$(dirname "$FOCUS")/memory.l
 sleep 0.2
 echo "== Crash keeps originals"
 kill -9 "$DAEMON_PID"; wait "$DAEMON_PID" 2>/dev/null
-"$BINARY" --config "$WORK/enforce.conf" --runtime-dir "$WORK/run" --cgroup-root "$FAKE" --proc-swaps "$WORK/swaps" --seat-directory "$WORK/seats" > "$WORK/enforce2.log" 2>&1 &
+"$BINARY" --config "$WORK/enforce.conf" --runtime-dir "$WORK/run" --cgroup-root "$FAKE" --proc-swaps "$WORK/swaps" --seat-directory "$WORK/seats" --proc-cgroups "$WORK/proc" > "$WORK/enforce2.log" 2>&1 &
 DAEMON_PID=$!
 wait_for 'event=STARTED' "$WORK/enforce2.log"
 sleep 0.5
 check_contains "originals are reloaded" 'event=ORIGINALS_RESTORED' "$WORK/enforce2.log"
+check "after a crash memory.high returns to the original until a report" "$(read_value "$FOCUS/memory.high")" max
+check "after a crash cpu.weight returns to the original until a report" "$(read_value "$FOCUS/cpu.weight")" 100
 kill "$DAEMON_PID"; wait "$DAEMON_PID"
 check "enforce exit status" "$?" 0
 DAEMON_PID=""
@@ -206,7 +345,7 @@ check "originals file removed" "$(ls "$WORK/run/ORIGINAL_VALUES" 2>/dev/null | w
 if grep -qE 'AddressSanitizer|runtime error' "$WORK/enforce.log" "$WORK/enforce2.log"; then echo "FAIL sanitizer in enforce"; FAILURES=$((FAILURES + 1)); else echo "PASS no sanitizer report in enforce"; fi
 
 echo "== Demotion after focus leaves"
-"$BINARY" --config "$WORK/enforce.conf" --runtime-dir "$WORK/run" --cgroup-root "$FAKE" --proc-swaps "$WORK/swaps" --seat-directory "$WORK/seats" > "$WORK/enforce3.log" 2>&1 &
+"$BINARY" --config "$WORK/enforce.conf" --runtime-dir "$WORK/run" --cgroup-root "$FAKE" --proc-swaps "$WORK/swaps" --seat-directory "$WORK/seats" --proc-cgroups "$WORK/proc" > "$WORK/enforce3.log" 2>&1 &
 DAEMON_PID=$!
 wait_for 'event=STARTED' "$WORK/enforce3.log"
 sleep 0.5
@@ -219,9 +358,8 @@ mv "$FOCUS/cpu.weight" "$WORK/cpu.weight.saved"
 wait_for 'FOREGROUND_CPU_WEIGHT=UNAVAILABLE' "$WORK/run/STATUS"
 check_contains "status shows a missing CPU controller" 'FOREGROUND_CPU_WEIGHT=UNAVAILABLE' "$WORK/run/STATUS"
 mv "$WORK/cpu.weight.saved" "$FOCUS/cpu.weight"
-# A process outside app.slice clears the foreground: systemd --user runs in user@.service itself.
-USER_MANAGER=$(pgrep -u "$(id -u)" -xo systemd)
-send_focus "$USER_MANAGER"
+# A process outside app.slice clears the foreground.
+send_focus "$OUTSIDE_PID"
 wait_for 'event=FOCUS_CHANGED group=NONE' "$WORK/enforce3.log"
 check_contains "focus outside app.slice clears foreground" 'event=FOCUS_CHANGED group=NONE' "$WORK/enforce3.log"
 check "grace keeps the old limit" "$(read_value "$FOCUS/memory.high")" "$HIGH_75"
@@ -234,7 +372,7 @@ DAEMON_PID=""
 
 echo "== Permission checks"
 start_enforce_daemon() { # log
-    "$BINARY" --config "$WORK/enforce.conf" --runtime-dir "$WORK/run" --cgroup-root "$FAKE" --proc-swaps "$WORK/swaps" --seat-directory "$WORK/seats" > "$1" 2>&1 &
+    "$BINARY" --config "$WORK/enforce.conf" --runtime-dir "$WORK/run" --cgroup-root "$FAKE" --proc-swaps "$WORK/swaps" --seat-directory "$WORK/seats" --proc-cgroups "$WORK/proc" > "$1" 2>&1 &
     DAEMON_PID=$!
     wait_for 'event=STARTED' "$1"
     sleep 0.5
@@ -251,7 +389,7 @@ check "the focus socket is closed to other users" "$(stat -c %a "$WORK/run/focus
 send_focus $$
 wait_for 'FOCUS_REPORT_REJECTED' "$WORK/seat.log"
 check_contains "rejects a sender without the active seat" 'reason=NOT_ACTIVE_SEAT_USER' "$WORK/seat.log"
-check "no priority without the active seat" "$(read_value "$FOCUS/memory.high")" "$HIGH_50"
+check "a refused report gives no priority and starts no background limit" "$(read_value "$FOCUS/memory.high")" max
 if [ "$(id -u)" != 0 ]; then
     sleep 2.2
     check "a refused owner change is logged once and tried again" "$(grep -c 'event=FOCUS_SOCKET_REPLACE_FAILED' "$WORK/seat.log")" 1
@@ -272,6 +410,9 @@ mkdir -p "$BAD_SPACE" "$BAD_LINE"
 make_group "$BAD_SPACE" max max max 100 "max 100000"
 make_group "$BAD_LINE" max max max 100 "max 100000"
 start_enforce_daemon "$WORK/names.log"
+send_focus "$OUTSIDE_PID"
+wait_for 'event=FOCUS_REPORTER_SEEN' "$WORK/names.log"
+check "a valid name gets the limit, so the next two checks mean something" "$(read_value "$FOCUS/memory.high")" "$HIGH_50"
 check "ignores a group name with a space" "$(read_value "$BAD_SPACE/memory.high")" max
 check "ignores a group name with a line break" "$(read_value "$BAD_LINE/memory.high")" max
 stop_enforce_daemon "$WORK/names.log"
@@ -349,6 +490,8 @@ check_contains "the active user's limit holds across scans" 'GROUPS=1027 ' "$WOR
 stop_enforce_daemon "$WORK/flood.log"
 rm -rf "$FAKE$APP_SLICE"/seat-first*.scope "$FAKE$APP_SLICE"/seat-second*.scope
 start_enforce_daemon "$WORK/flood.log"
+send_focus "$OUTSIDE_PID"
+wait_for 'event=FOCUS_REPORTER_SEEN' "$WORK/flood.log"
 for VICTIM in $VICTIMS; do check "a group enters the table before the flood" "$(read_value "$VICTIM/memory.high")" "$HIGH_50"; done
 for FOREIGN_UID in 200001 200002 200003 200004 200005 200006 200007 200008; do create_foreign_groups "$FOREIGN_UID"; done
 wait_for 'GROUPS=3586 ' "$WORK/run/STATUS"
@@ -377,7 +520,7 @@ done
 rm -rf "$NEW_GROUP" "$FAKE"/user.slice/user-20000?.slice "$FAKE"/user.slice/user-20010?.slice
 
 chmod 775 "$WORK/run"
-"$BINARY" --config "$WORK/enforce.conf" --runtime-dir "$WORK/run" --cgroup-root "$FAKE" --proc-swaps "$WORK/swaps" --seat-directory "$WORK/seats" > /dev/null 2>&1
+"$BINARY" --config "$WORK/enforce.conf" --runtime-dir "$WORK/run" --cgroup-root "$FAKE" --proc-swaps "$WORK/swaps" --seat-directory "$WORK/seats" --proc-cgroups "$WORK/proc" > /dev/null 2>&1
 check "refuses a runtime directory others can change" "$?" 1
 chmod 700 "$WORK/run"
 if [ "$(id -u)" != 0 ]; then
@@ -408,7 +551,7 @@ run_retire() { # zram_used_kib file_used_kib
         echo "/dev/zram0 partition $MEMORY_KIB $1 100"
         echo "$WORK/swap_files/1 file $MEMORY_KIB $2 -1"
     } > "$WORK/retire_swaps"
-    "$BINARY" --config "$RETIRE_CONFIG" --runtime-dir "$WORK/run" --cgroup-root "$FAKE" --proc-swaps "$WORK/retire_swaps" --seat-directory "$WORK/seats" > "$WORK/retire.log" 2>&1 &
+    "$BINARY" --config "$RETIRE_CONFIG" --runtime-dir "$WORK/run" --cgroup-root "$FAKE" --proc-swaps "$WORK/retire_swaps" --seat-directory "$WORK/seats" --proc-cgroups "$WORK/proc" > "$WORK/retire.log" 2>&1 &
     DAEMON_PID=$!
     wait_for 'event=STARTED' "$WORK/retire.log"
     sleep 2.5
@@ -502,10 +645,12 @@ EOF
     sleep 300 &
     SLEEPER=$!
     echo "$SLEEPER" > "$OTHER/cgroup.threads"
-    "$BINARY" --config "$WORK/selector.conf" --runtime-dir "$WORK/run" --cgroup-root "$FAKE" --proc-swaps "$WORK/swaps" --seat-directory "$WORK/seats" > "$WORK/selector.log" 2>&1 &
+    "$BINARY" --config "$WORK/selector.conf" --runtime-dir "$WORK/run" --cgroup-root "$FAKE" --proc-swaps "$WORK/swaps" --seat-directory "$WORK/seats" --proc-cgroups "$WORK/proc" > "$WORK/selector.log" 2>&1 &
     DAEMON_PID=$!
     wait_for 'event=STARTED' "$WORK/selector.log"
     sleep 0.5
+    send_focus "$OUTSIDE_PID"
+    wait_for 'event=FOCUS_REPORTER_SEEN' "$WORK/selector.log"
     AFFINITY=$(expand_cpus "$(taskset -cp "$SLEEPER" | sed 's/.*: //')")
     kill "$DAEMON_PID"; wait "$DAEMON_PID" 2>/dev/null
     DAEMON_PID=""
@@ -519,7 +664,7 @@ check "EFFICIENCY selects the middle class" "$AFFINITY" "$(cpu_list CPU_EFFICIEN
 run_selector LOW_POWER
 check "LOW_POWER selects the slowest class" "$AFFINITY" "$(cpu_list CPU_LOW_POWER)"
 run_selector LEAST_BUSY:10
-EXPECTED_COUNT=$(( ( $(nproc) * 10 + 99 ) / 100 ))
+EXPECTED_COUNT=$(( ( CPUS * 10 + 99 ) / 100 ))
 ACTUAL_COUNT=$(echo "$AFFINITY" | tr ',' '\n' | wc -l)
 check "LEAST_BUSY:10 selects 10% of CPUs" "$ACTUAL_COUNT" "$EXPECTED_COUNT"
 if grep -qE 'AddressSanitizer|runtime error' "$WORK/selector.log"; then echo "FAIL sanitizer in selectors"; FAILURES=$((FAILURES + 1)); else echo "PASS no sanitizer report in selectors"; fi

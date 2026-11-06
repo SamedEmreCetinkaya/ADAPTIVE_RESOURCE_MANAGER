@@ -46,7 +46,7 @@ the one machine this has run on, not a minimum.
 | Pressure information turned on | If `/proc/pressure/memory` is missing, the daemon treats the system as never calm, so it does no idle read and retires no swap file by itself. Add `psi=1` to the kernel command line if your kernel has it off by default | Available |
 | cgroup v2 with `memory_recursiveprot` | Protection must reach the groups inside an application. systemd usually mounts it this way | Enabled |
 | systemd with user managers and logind | Application groups under `app.slice`, and the active seat in `/run/systemd/seats` | 257 |
-| GNOME on Wayland | The focus reporter. Without it no application becomes foreground, and only the background policy and swap return work. The extension declares GNOME 48 only | 48.7 |
+| GNOME on Wayland | The focus reporter. Without it no application gets priority or a background limit, and only swap management and kernel settings work. The extension declares GNOME 48 only | 48.7 |
 
 ### To enable the memory settings and run the scripts
 
@@ -59,22 +59,74 @@ the one machine this has run on, not a minimum.
 | `coreutils`, `awk`, `sed`, `getent` and `procps`: `sysctl`, `pgrep` | Scripts and tests | coreutils 9.7, gawk 5.2, procps 4.0 |
 | `python3` | Tests only | 3.13 |
 
-On Debian:
+To build, test and enable everything:
 
 ```sh
-sudo apt install build-essential linux-libc-dev python3 swapspace systemd-zram-generator
+# Debian and Ubuntu
+sudo apt install gcc make libc6-dev linux-libc-dev python3 swapspace systemd-zram-generator
+# Fedora
+sudo dnf install gcc make glibc-devel kernel-headers python3 zram-generator
+# Arch Linux
+sudo pacman -S --needed gcc make linux-api-headers python zram-generator
+# openSUSE
+sudo zypper install gcc make glibc-devel linux-glibc-devel python3 zram-generator
 ```
 
-The other tools come with a standard Debian system.
+The default repositories of Fedora, Arch Linux and openSUSE have no `swapspace`. Arch Linux has it in the
+AUR. `ENABLE_ENFORCE.sh` also needs a `swapspace.service` unit, so a copy built from source has to bring
+its own. `make sanitize` also needs `libasan libubsan` on Fedora and `libasan8 libubsan1` on openSUSE. The
+other tools come with a standard desktop install.
 
 If your kernel enables zswap by default, disable it with `zswap.enabled=0` on the kernel command line.
 It would compress pages twice on top of zram.
+
+## Compatibility
+
+Run `sh SCRIPTS/CHECK_SYSTEM.sh` first. It needs no root and changes nothing. `INSTALL.sh` and
+`ENABLE_ENFORCE.sh` run the same check: `BLOCK` stops them before they change anything, and `WARN` only
+prints. Distributions without systemd, such as Alpine, Void, Artix and Devuan, cannot run this software.
+
+What works depends on the desktop, because only the direct children of `app.slice` count as applications
+and only the GNOME extension reports focus. Only the first row has been run. The others follow from the code.
+
+| Desktop | Priority for the focused application | Background limits | Swap files, zram, disk limit, kernel settings |
+| --- | --- | --- | --- |
+| GNOME 48 | Yes | Yes | Yes |
+| Other GNOME versions | No, the extension declares 48 only | No | Yes |
+| KDE Plasma | No, it has no reporter | No | Yes |
+| XFCE, i3, Sway and others | No, it has no reporter | No | Yes |
+| Terminal only or SSH | No | No | Yes |
+
+A reporter for another desktop only has to send the focused window's process ID to
+`/run/adaptive-resource-manager/focus.sock`, and that desktop must start each application in its own group
+under `app.slice`.
+
+### Distributions
+
+`TESTS/RUN_DISTRO_TESTS.sh` built the daemon and ran the unprivileged tests in a container of each
+distribution in November 2026. Containers share the host's kernel, so this proves nothing about zram, swap
+files, SELinux or the desktop on those systems. Only Debian 13 has run the whole software, on real hardware.
+
+| Distribution | Kernel package | GNOME | `swapspace` package | Build and tests | Focus reporter |
+| --- | --- | --- | --- | --- | --- |
+| Debian 13 | 6.12 | 48.7 | 1.18 | Pass | Yes |
+| Ubuntu 24.04 | 6.8 | 46.0 | 1.18 | Pass | No |
+| Ubuntu 26.04 | 7.0 | 50.1 | 1.18 | Pass | No |
+| Fedora 45 | 7.2.15 | 51.1 | None | Pass | No |
+| Arch Linux | 7.2.14 | 51.1 | AUR only | Pass | No |
+| openSUSE Tumbleweed | 7.3.1 | 51.1 | None | Pass | No |
+| Debian 12 | 6.1 | 43.9 | 1.18 | Refused: Linux 6.7 or newer is needed | No |
+
+The passing builds used GCC 13 to 16, glibc 2.39 to 2.44 and Linux headers 6.8 to 7.3. All seven
+distributions package `zram-generator`. Without `swapspace`, `INSTALL.sh` still works and
+`ENABLE_ENFORCE.sh` stops before it changes anything.
 
 ## Installation
 
 Run these from your own account. `sudo` tells the scripts which user owns the desktop session.
 
 ```sh
+sh SCRIPTS/CHECK_SYSTEM.sh        # no root, changes nothing
 make                              # build
 make test                         # no root, no real setting touched
 sudo sh TESTS/RUN_ROOT_TESTS.sh   # real kernel test with its own swap file, about one minute
@@ -90,7 +142,8 @@ Check the state with `cat /run/adaptive-resource-manager/STATUS`. The log is in
 `journalctl -u adaptive-resource-manager`. `event=FOCUS_STALL` reports how long an application stalled
 right after a click, which is the number to compare before and after enforcing.
 
-`FOREGROUND_CPU_WEIGHT=UNAVAILABLE` means the CPU controller is off for that group. systemd enables it in
+`FOCUS_REPORTER=NONE` means no focus report was accepted since the daemon started, so applications keep
+their own limits. `FOREGROUND_CPU_WEIGHT=UNAVAILABLE` means the CPU controller is off for that group. systemd enables it in
 `app.slice` only while a member asks for it, so `INSTALL.sh` makes every `app-*.scope` ask. This applies
 to applications started after the install.
 
@@ -169,8 +222,8 @@ The daemon itself is split by responsibility:
 | `CONFIG/RESOURCE_POLICY.conf` | Focus, memory, CPU and readback policy |
 | `CONFIG/SYSTEM_TUNABLES.conf` | zram, swapspace and sysctl values relative to memory |
 | `SYSTEMD/` | Service units and the CPU controller rule |
-| `SCRIPTS/` | Install, enable, disable and uninstall |
-| `TESTS/` | Unprivileged tests and real kernel tests |
+| `SCRIPTS/` | Check, install, enable, disable and uninstall |
+| `TESTS/` | Unprivileged tests, distribution tests in Docker and real kernel tests |
 
 ## How it works
 
@@ -183,6 +236,10 @@ At a focus change:
 3. Its swapped pages are read back with `process_madvise(MADV_WILLNEED)`. Another focus change cancels
    the read.
 4. After `BACKGROUND_GRACE_SECONDS` the previous group returns to the background policy.
+
+The background policy starts with the first accepted focus report. Until then every application keeps its
+own limits, because without a reporter the application in use would count as background too. After a crash
+the daemon first returns the limits it left behind to their saved originals.
 
 Separately, a swap file goes back to the disk as soon as the system is calm and `swapoff` would read at
 most `SWAP_FILE_RETIRE_UNREACHABLE_PERCENT` of memory. Pages still in the swap cache need no read, so a
@@ -279,6 +336,18 @@ To report a security problem, contact the maintainer through GitHub before publi
 
 ## Known limits
 
+- `RUN_DISTRO_TESTS.sh` froze the one tested machine once, on XanMod 7.2.15 with a virtual machine starting
+  beside it. The journal's clock had run backwards at container starts, then the kernel reported that the CPU
+  time counter ran backwards. The same test on Debian 7.2.11 showed no clock trouble, also after a suspend, so
+  that kernel is the main suspect. This rests on one run on XanMod. The script refuses to run next to a virtual
+  machine and reports clock trouble after each image.
+- `systemd-oomd`, on by default on Fedora and Ubuntu desktops, and `earlyoom` kill applications by their own
+  rules on swap use and memory pressure. This software lets both rise, and they have not been tested
+  together. `CHECK_SYSTEM.sh` warns about them.
+- After the daemon restarts, nothing gets priority or a background limit until the focused window changes,
+  because the extension reports changes only.
+- A reporter counts until the daemon restarts. If a later session at the same seat has none, its
+  applications get the background policy with no foreground.
 - It writes cgroup files directly, outside systemd's single writer rule. A manual `set-property` can
   overwrite its limits until the next focus change.
 - Pages in tmpfs or GPU memory cannot be read back; only `swapoff` reaches them.

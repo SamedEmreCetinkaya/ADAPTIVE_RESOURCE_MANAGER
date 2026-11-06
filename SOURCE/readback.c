@@ -21,6 +21,10 @@
 #include <sys/uio.h>
 #include <unistd.h>
 
+#ifndef PAGEMAP_SCAN
+#error "Linux headers 6.7 or newer are required: <linux/fs.h> has no PAGEMAP_SCAN"
+#endif
+
 #define PAGEMAP_SWAP_BIT (1ULL << 62)
 #define PAGEMAP_TYPE_MASK 31ULL
 #define PAGEMAP_OFFSET_SHIFT 5

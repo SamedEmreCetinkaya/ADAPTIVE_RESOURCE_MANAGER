@@ -84,6 +84,7 @@ struct runtime_paths {
     char runtime_directory[PATH_BUFFER_SIZE];
     char proc_swaps[PATH_BUFFER_SIZE];
     char seat_directory[PATH_BUFFER_SIZE];
+    char proc_cgroups[PATH_BUFFER_SIZE];
 };
 
 struct pressure_sample {
@@ -184,6 +185,8 @@ void app_groups_refresh(void);
 void app_groups_restore_all(void);
 void app_groups_process_timers(double now);
 void app_groups_set_foreground(const char *group_path, double now);
+void app_groups_note_focus_reporter(void);
+bool app_groups_focus_reporter_seen(void);
 const char *app_groups_foreground_path(void);
 const char *app_groups_foreground_name(void);
 void app_groups_foreground_cpu_weight_text(char *buffer, size_t size);

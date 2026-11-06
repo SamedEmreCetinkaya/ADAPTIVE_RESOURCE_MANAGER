@@ -243,7 +243,13 @@ static void apply_foreground(struct app_group *group) {
     apply_cpu_selector(group, &g_policy.foreground_cpu_set, selector_restricts(&g_policy.background_cpu_set));
 }
 
+// A background limit only makes sense against a foreground. Without a focus reporter, as on a desktop the
+// extension does not support, the application in use would count as background too. Stays set until the
+// daemon restarts: a reporter that went quiet does not prove that the next session has none.
+static bool g_focus_reporter_seen;
+
 static void apply_background(struct app_group *group) {
+    if (!g_focus_reporter_seen) return;
     uint64_t memory = g_system.memory_total_bytes;
     set_limit(group->path, "memory.high",
               limit_min(group->original_memory_high, percent_limit(memory, g_policy.background_memory_high_percent)));
@@ -343,6 +349,8 @@ void app_groups_load_saved_originals(void) {
         group->original_swap_max = swap;
         group->original_cpu_weight = weight;
         if (fields >= 5) snprintf(group->original_cpu_max, sizeof group->original_cpu_max, "%s%s%s", cpu_max, cpu_second[0] ? " " : "", cpu_second);
+        // The crashed daemon left its limits here, and nothing applies new ones before a focus report.
+        restore_original(group);
         restored++;
     }
     fclose(file);
@@ -509,6 +517,15 @@ void app_groups_set_foreground(const char *group_path, double now) {
     }
 }
 
+void app_groups_note_focus_reporter(void) {
+    if (g_focus_reporter_seen) return;
+    g_focus_reporter_seen = true;
+    for (int i = 0; i < g_group_count; i++) apply_background(&g_groups[i]);
+    log_event("event=FOCUS_REPORTER_SEEN groups=%d", g_group_count);
+}
+
+bool app_groups_focus_reporter_seen(void) { return g_focus_reporter_seen; }
+
 const char *app_groups_foreground_path(void) { return g_foreground ? g_foreground->path : ""; }
 const char *app_groups_foreground_name(void) { return g_foreground ? group_name(g_foreground->path) : "NONE"; }
 
@@ -525,8 +542,8 @@ int app_groups_count(void) { return g_group_count; }
 // Maps a process to the direct child of app.slice that contains it. The group must belong to the
 // given user, so nobody can give priority to a group of another user.
 bool app_group_path_of_pid(pid_t pid, uid_t owner, char *group_path, size_t size) {
-    char path[64], text[PATH_BUFFER_SIZE];
-    snprintf(path, sizeof path, "/proc/%d/cgroup", pid);
+    char path[PATH_BUFFER_SIZE + 32], text[PATH_BUFFER_SIZE];
+    snprintf(path, sizeof path, "%s/%d/cgroup", g_paths.proc_cgroups, pid);
     FILE *file = fopen(path, "r");
     if (!file) return false;
     bool found = false;

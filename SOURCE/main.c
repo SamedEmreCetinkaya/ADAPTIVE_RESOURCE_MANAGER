@@ -235,8 +235,9 @@ static void write_status(void) {
     fchmod(fileno(file), 0644);
     struct swap_layout layout;
     long long disk_mib = swap_layout_read(&layout) ? layout.managed_used_kib / 1024 : 0;
-    fprintf(file, "RUN_MODE=%s FOREGROUND=%s FOREGROUND_CPU_WEIGHT=%s GROUPS=%d DISK_SWAP_MIB=%lld MEMORY_AVAILABLE_MIB=%llu %s\n",
-            g_policy.run_mode == RUN_MODE_ENFORCE ? "ENFORCE" : "OBSERVE", app_groups_foreground_path()[0] ? "ACTIVE" : "NONE", cpu_weight, app_groups_count(), disk_mib,
+    fprintf(file, "RUN_MODE=%s FOREGROUND=%s FOCUS_REPORTER=%s FOREGROUND_CPU_WEIGHT=%s GROUPS=%d DISK_SWAP_MIB=%lld MEMORY_AVAILABLE_MIB=%llu %s\n",
+            g_policy.run_mode == RUN_MODE_ENFORCE ? "ENFORCE" : "OBSERVE", app_groups_foreground_path()[0] ? "ACTIVE" : "NONE",
+            app_groups_focus_reporter_seen() ? "SEEN" : "NONE", cpu_weight, app_groups_count(), disk_mib,
             (unsigned long long)(memory_available_bytes() / MEBIBYTE), readback);
     fclose(file);
     rename(temporary, path);
@@ -296,6 +297,7 @@ static int run_daemon(void) {
             pid_t pid;
             uid_t sender;
             for (int report = 0; report < MAX_FOCUS_REPORTS_PER_POLL && read_focus_report(focus_socket, &pid, &sender); report++) {
+                app_groups_note_focus_reporter();
                 if (!app_group_path_of_pid(pid, sender, pending_path, sizeof pending_path)) pending_path[0] = '\0';
                 pending = true;
                 pending_pid = pid;
@@ -331,7 +333,7 @@ static int run_daemon(void) {
 }
 
 static void print_usage(const char *program) {
-    printf("Usage: %s [--config PATH] [--runtime-dir DIR] [--cgroup-root DIR] [--proc-swaps PATH] [--seat-directory DIR] [--probe] [--print-policy [--assume-memory-gib N]]\n", program);
+    printf("Usage: %s [--config PATH] [--runtime-dir DIR] [--cgroup-root DIR] [--proc-swaps PATH] [--seat-directory DIR] [--proc-cgroups DIR] [--probe] [--print-policy [--assume-memory-gib N]]\n", program);
 }
 
 int main(int argc, char **argv) {
@@ -341,6 +343,7 @@ int main(int argc, char **argv) {
         {"cgroup-root", required_argument, NULL, 'g'},
         {"proc-swaps", required_argument, NULL, 's'},
         {"seat-directory", required_argument, NULL, 'S'},
+        {"proc-cgroups", required_argument, NULL, 'C'},
         {"probe", no_argument, NULL, 'p'},
         {"print-policy", no_argument, NULL, 'P'},
         {"assume-memory-gib", required_argument, NULL, 'm'},
@@ -354,6 +357,7 @@ int main(int argc, char **argv) {
     snprintf(g_paths.runtime_directory, sizeof g_paths.runtime_directory, "%s", DEFAULT_RUNTIME_DIRECTORY);
     snprintf(g_paths.proc_swaps, sizeof g_paths.proc_swaps, "/proc/swaps");
     snprintf(g_paths.seat_directory, sizeof g_paths.seat_directory, "%s", DEFAULT_SEAT_DIRECTORY);
+    snprintf(g_paths.proc_cgroups, sizeof g_paths.proc_cgroups, "/proc");
     int option;
     while ((option = getopt_long(argc, argv, "", OPTIONS, NULL)) != -1) {
         switch (option) {
@@ -362,6 +366,7 @@ int main(int argc, char **argv) {
         case 'g': snprintf(g_paths.cgroup_root, sizeof g_paths.cgroup_root, "%s", optarg); break;
         case 's': snprintf(g_paths.proc_swaps, sizeof g_paths.proc_swaps, "%s", optarg); break;
         case 'S': snprintf(g_paths.seat_directory, sizeof g_paths.seat_directory, "%s", optarg); break;
+        case 'C': snprintf(g_paths.proc_cgroups, sizeof g_paths.proc_cgroups, "%s", optarg); break;
         case 'p': probe = true; break;
         case 'P': print_only = true; break;
         case 'm': assumed_memory_gib = atof(optarg); break;

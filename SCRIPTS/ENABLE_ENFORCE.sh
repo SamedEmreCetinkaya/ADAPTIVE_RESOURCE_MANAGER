@@ -9,8 +9,8 @@ USER_NAME=${SUDO_USER:-}
 [ -n "$USER_NAME" ] && [ "$USER_NAME" != root ] || { echo "Run through sudo so your user manager can be updated."; exit 1; }
 USER_ID=$(id -u "$USER_NAME") || { echo "Unknown user: $USER_NAME"; exit 1; }
 [ -x /usr/local/sbin/adaptive-resource-managerd ] || { echo "Run INSTALL.sh first."; exit 1; }
-SWAPSPACE=$(command -v swapspace) || { echo "Install swapspace first. Nothing changed."; exit 1; }
-[ -x /usr/lib/systemd/system-generators/zram-generator ] || { echo "Install zram-generator first. Nothing changed."; exit 1; }
+sh "$ROOT/SCRIPTS/CHECK_SYSTEM.sh" enforce
+SWAPSPACE=$(command -v swapspace) || { echo "swapspace is not in root's PATH. Nothing changed."; exit 1; }
 
 TUNABLES=/etc/adaptive-resource-manager/SYSTEM_TUNABLES.conf
 [ -f "$TUNABLES" ] && [ ! -L "$TUNABLES" ] && [ "$(stat -c %u "$TUNABLES")" = 0 ] || { echo "Refusing $TUNABLES: only root may own it."; exit 1; }
